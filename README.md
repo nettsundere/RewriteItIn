@@ -1,19 +1,13 @@
 # Rewrite It In
 
-A code conversion tool that uses the DeepSeek v3 LLM to rewrite code from one programming/markup language to another while maintaining structure and functionality and following your principles.
-
-It also supports local LM Studio Server API with a bit of modification.
-
-It sends your data to the server specified.
-
-There is no guarantee.
+A code conversion tool that uses the DeepSeek v3 LLM or LM Studio API to rewrite code from one programming/markup language to another while maintaining structure and functionality and following your principles.
 
 ## Features
 
 - Converts code between programming/markup languages using LLM API
 - Supports batch processing of multiple files
 - Maintains directory structure in output
-- Optional file format filtering
+- Smart file format filtering
 - Customizable conversion principles
 - API key authentication support
 - Progress tracking and error reporting
@@ -32,13 +26,14 @@ Options:
   --target <path>        Target directory
   --target-lang <lang>   Target language
   --server <url>         API server URL
+  --model <model-name>   LLM Model (like deepseek-chat)
   --principles <text>    (Optional) Conversion principles
   --api-key <key>        (Optional) API key for authentication
-  --use-json-schema      (Optional) Use Json Schema
+```
 
 ### Example
 ```bash
-dotnet run --source  ../nettsundere.github.io --source-lang HTML --target ../test/w2 --target-lang HTML --server https://api.deepseek.com --principles "Fix the paths, make it look modern, add missing things" --api-key SAMPLE 
+dotnet run --source  ../nettsundere.github.io --source-lang HTML,CSS --target ../test/w2 --target-lang HTML,CSS,JavaScript --server https://api.deepseek.com --principles "Fix the paths, make it look modern, add missing things" --model deepseek-chat --api-key SAMPLE 
 ```
 
 ## License

@@ -8,11 +8,10 @@ open System.Text
 open System.Text.Json
 open System.Text.Json.Serialization
 
-let modelGlobal = "deepseek-chat"
 let batchSizeGlobal = 30
 let maxTokensGlobal = 8_192
 let globalTimeoutMinutes = 15;
-let globalTemperature = 0
+let globalTemperature = 1.3
 
 type ChatMessage = {
     role: string
@@ -32,19 +31,13 @@ type CodeFile = {
     content: string
 }
 
-type AnalysisContext = {
-    files: CodeFile list
-    sourceLang: string
-    targetLang: string
-    principles: string option
-}
-
 type Options = {
     SourcePath: string
     SourceLang: string
     TargetPath: string
     TargetLang: string
     ServerUrl: string
+    Model: string
     Principles: string option
     ApiKey: string option
 }
@@ -149,7 +142,7 @@ let readSourceFiles (sourcePath: string) (allowedFormats: string list option) =
     else
         failwith "Source path does not exist"
 
-let createFormatQueryPayload (sourceLang: string) (targetLang: string) (principles: string) =
+let createFormatQueryPayload (options: Options) =
     let systemMessage = {
         role = "system"
         content = "Keep the dot, strip whitespace. Do not add anything else, just formats. Response must be newline (\\n) separated list of formats. End with the newline.
@@ -162,18 +155,19 @@ let createFormatQueryPayload (sourceLang: string) (targetLang: string) (principl
 
     let userMessage = {
         role = "user"
-        content = $"List all file extensions are used when writing apps using {sourceLang} OR {targetLang}, ignore binary files. Also, these are the conversion principles as specified by the User: " + principles
+        content = $"List all file extensions are used when writing apps using {options.SourceLang} OR {options.TargetLang}, ignore binary files. Also, these are the conversion principles as specified by the User: " + (options.Principles |> Option.defaultValue "None")
+
     }
 
     {
-        model = modelGlobal
+        model = options.Model
         messages = [systemMessage; userMessage]
         temperature = globalTemperature
         max_tokens = maxTokensGlobal
         stream = false
     }
 
-let createAnalysisPayload (files: CodeFile list) =
+let createAnalysisPayload (options: Options) (files: CodeFile list) =
     let systemMessage = {
         role = "system"
         content = "Analyze these code files and identify which ones are important when rewriting it to another language.
@@ -190,23 +184,23 @@ let createAnalysisPayload (files: CodeFile list) =
     }
 
     {
-        model = modelGlobal
+        model = options.Model
         messages = [systemMessage; userMessage]
         temperature = globalTemperature
         max_tokens = maxTokensGlobal
         stream = false
     }
 
-let createRewritePayload (files: CodeFile list) (context: AnalysisContext) =
+let createRewritePayload (options: Options) (files: CodeFile list) =
     let principlesPart = 
-        context.principles 
+        options.Principles 
         |> Option.map (fun p -> $"Follow these mandatory principles: {p}.")
         |> Option.defaultValue ""
         
     let systemMessage = {
         role = "system"
         content =
-            $"You have to rewrite code in {context.targetLang} using the source in {context.sourceLang} as example." + principlesPart + "User input is JSON. Always respond with complete, unabridged answers. What you respond with is the final result. Do not simplify for brevity.
+            $"You have to rewrite code in {options.TargetLang} using the source in {options.SourceLang} as example." + principlesPart + "User input is JSON. Always respond with complete, unabridged answers. What you respond with is the final result. Do not simplify for brevity.
             Respond using the following format (zero or more files, feel free to change filenames, or create new files), provide no comments besides it:
 ```relative/path/to/write.cs
 the source code to write to file write.cs
@@ -225,26 +219,26 @@ the source code to write to file write2.cs
     }
 
     {
-        model = modelGlobal
+        model = options.Model
         messages = [systemMessage; userMessage]
         temperature = globalTemperature
         max_tokens = maxTokensGlobal
         stream = false
     }
 
-let sendRequest (serverUrl: string) (apiKey: string option) (payload: ChatRequest) =
+let sendRequest options payload =
     async {
         use client = new HttpClient()
         client.Timeout <- TimeSpan.FromMinutes(globalTimeoutMinutes)
-        let url = $"{serverUrl}/v1/chat/completions"
+        let url = $"{options.ServerUrl}/v1/chat/completions"
         
-        let options = JsonSerializerOptions()
-        options.DefaultIgnoreCondition <- JsonIgnoreCondition.WhenWritingNull
-        let json = JsonSerializer.Serialize(payload, options)
+        let jsOptions = JsonSerializerOptions()
+        jsOptions.DefaultIgnoreCondition <- JsonIgnoreCondition.WhenWritingNull
+        let json = JsonSerializer.Serialize(payload, jsOptions)
         
         let content = new StringContent(json, Encoding.UTF8, "application/json")
         
-        match apiKey with
+        match options.ApiKey with
         | Some key -> client.DefaultRequestHeaders.Add("Authorization", $"Bearer {key}")
         | None -> ()
         
@@ -344,6 +338,7 @@ let parseCommandLine (args: string[]) =
         | "--target" :: tgt :: rest -> parseInternal rest { options with TargetPath = tgt }
         | "--target-lang" :: lang :: rest -> parseInternal rest { options with TargetLang = lang }
         | "--server" :: url :: rest -> parseInternal rest { options with ServerUrl = url }
+        | "--model" :: model :: rest -> parseInternal rest { options with Model = model }
         | "--principles" :: principles :: rest -> parseInternal rest { options with Principles = Some principles }
         | "--api-key" :: key :: rest -> parseInternal rest { options with ApiKey = Some key }
         | x :: _ -> failwith $"Unknown option: {x}"
@@ -354,16 +349,17 @@ let parseCommandLine (args: string[]) =
         TargetPath = ""
         TargetLang = ""
         ServerUrl = ""
+        Model = ""
         Principles = None
         ApiKey = None
     }
     
     parseInternal (args |> Array.toList) defaultOptions
 
-let queryRelevantFormats serverUrl apiKey sourceLang targetLang principles =
+let queryRelevantFormats (options: Options) =
     printfn "\n=== Querying relevant file formats ==="
-    let payload = createFormatQueryPayload sourceLang targetLang principles 
-    let response = sendRequest serverUrl apiKey payload |> Async.RunSynchronously
+    let payload = createFormatQueryPayload options
+    let response = sendRequest options payload |> Async.RunSynchronously
     parseListResponse response
 
 let printBatch list =
@@ -371,7 +367,7 @@ let printBatch list =
     list 
     |> List.iter (fun file -> printfn $"  - {file.path}")
 
-let filterImportantFiles serverUrl apiKey (allFiles: CodeFile list) =
+let filterImportantFiles options allFiles =
     printfn "\n=== Filtering important files ==="
     let batchSize = batchSizeGlobal
     let batches = 
@@ -382,8 +378,8 @@ let filterImportantFiles serverUrl apiKey (allFiles: CodeFile list) =
     for batch in batches do
         printfn $"Analyzing batch of {batch.Length} files..."
         printBatch batch
-        let payload = createAnalysisPayload batch
-        let response = sendRequest serverUrl apiKey payload |> Async.RunSynchronously
+        let payload = createAnalysisPayload options batch
+        let response = sendRequest options payload |> Async.RunSynchronously
         
         match parseListResponse response with
         | Some results -> 
@@ -395,11 +391,11 @@ let filterImportantFiles serverUrl apiKey (allFiles: CodeFile list) =
     allFiles
         |> List.filter (fun file -> Set.contains file.path importantFiles)
 
-let rewriteFiles serverUrl apiKey (context: AnalysisContext) (files: CodeFile list)  =
+let rewriteFiles (options: Options) (files: CodeFile list)  =
     printfn $"\nProcessing {files.Length} files..."
     try
-        let payload = createRewritePayload files context
-        let response = sendRequest serverUrl apiKey payload |> Async.RunSynchronously
+        let payload = createRewritePayload options files
+        let response = sendRequest options payload |> Async.RunSynchronously
         
         match parseRewriteResponse response with
         | Some results ->
@@ -414,9 +410,8 @@ let rewriteFiles serverUrl apiKey (context: AnalysisContext) (files: CodeFile li
 
 let runConversion (options: Options) =
     try
-        let principles = options.Principles |> Option.defaultValue "None"
         printfn $"Determining relevant file formats for {options.SourceLang} -> {options.TargetLang} conversion"
-        let relevantFormatsList = queryRelevantFormats options.ServerUrl options.ApiKey options.SourceLang options.TargetLang principles 
+        let relevantFormatsList = queryRelevantFormats options
         let relevantFormats = match relevantFormatsList with Some f -> String.Join(", ", f) | None -> "All files"
         printfn $"Relevant formats: {relevantFormats}"
 
@@ -425,16 +420,9 @@ let runConversion (options: Options) =
         printfn $"Found {allSourceFiles.Length} relevant files to process"
 
         // Filter to get only important files
-        let importantFiles = filterImportantFiles options.ServerUrl options.ApiKey allSourceFiles
+        let importantFiles = filterImportantFiles options allSourceFiles
         printfn $"Identified {importantFiles.Length} important files to convert"
 
-        let context = {
-            files = importantFiles
-            sourceLang = options.SourceLang
-            targetLang = options.TargetLang
-            principles = options.Principles
-        }
-        
         Directory.CreateDirectory(options.TargetPath) |> ignore
         let mutable successCount = 0
 
@@ -446,7 +434,7 @@ let runConversion (options: Options) =
 
         for batch in batches do
             printBatch batch
-            match rewriteFiles options.ServerUrl options.ApiKey context batch with
+            match rewriteFiles options batch with
             | Some results ->
                 results |> List.iter (fun result ->
                     writeOutputFile options.TargetPath result
@@ -477,6 +465,7 @@ let main argv =
             printfn "  --target <path>        Target directory"
             printfn "  --target-lang <lang>   Target language"
             printfn "  --server <url>         API server URL"
+            printfn "  --model <model-name>   LLM Model (like deepseek-chat)"
             printfn "  --principles <text>    (Optional) Conversion principles"
             printfn "  --api-key <key>        (Optional) API key for authentication"
             1
@@ -488,7 +477,8 @@ let main argv =
             if String.IsNullOrEmpty(options.TargetPath) then failwith "Target path is required"
             if String.IsNullOrEmpty(options.TargetLang) then failwith "Target language is required"
             if String.IsNullOrEmpty(options.ServerUrl) then failwith "Server URL is required"
-            
+            if String.IsNullOrEmpty(options.Model) then failwith "LLM Model is required"
+
             runConversion options
     with
     | ex ->
