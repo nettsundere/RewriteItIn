@@ -120,7 +120,7 @@ let readSourceFiles (sourcePath: string) (allowedFormats: string list option) =
 
     if Directory.Exists sourcePath then
         Directory.GetFiles(sourcePath, "*", SearchOption.AllDirectories)
-        |> Array.toList  // Convert array to list
+        |> Array.toList  
         |> List.filter (isBinaryFile >> not)
         |> filterByFormat
         |> List.map (fun filePath -> 
@@ -142,7 +142,7 @@ let readSourceFiles (sourcePath: string) (allowedFormats: string list option) =
     else
         failwith "Source path does not exist"
 
-let createFormatQueryPayload (options: Options) =
+let createFormatQueryPayload (options: Options) (history: ChatMessage list) =
     let systemMessage = {
         role = "system"
         content = "Keep the dot, strip whitespace. Do not add anything else, just formats. Response must be newline (\\n) separated list of formats. End with the newline.
@@ -161,13 +161,13 @@ let createFormatQueryPayload (options: Options) =
 
     {
         model = options.Model
-        messages = [systemMessage; userMessage]
+        messages = userMessage :: systemMessage :: history
         temperature = globalTemperature
         max_tokens = maxTokensGlobal
         stream = false
     }
 
-let createAnalysisPayload (options: Options) (files: CodeFile list) =
+let createAnalysisPayload (options: Options) (files: CodeFile list) (history: ChatMessage list) =
     let systemMessage = {
         role = "system"
         content = "Analyze these code files and identify which ones are important when rewriting it to another language.
@@ -185,13 +185,13 @@ let createAnalysisPayload (options: Options) (files: CodeFile list) =
 
     {
         model = options.Model
-        messages = [systemMessage; userMessage]
+        messages = userMessage :: systemMessage :: history
         temperature = globalTemperature
         max_tokens = maxTokensGlobal
         stream = false
     }
 
-let createRewritePayload (options: Options) (files: CodeFile list) =
+let createRewritePayload (options: Options) (files: CodeFile list) (history: ChatMessage list)=
     let principlesPart = 
         options.Principles 
         |> Option.map (fun p -> $"Follow these mandatory principles: {p}.")
@@ -201,13 +201,13 @@ let createRewritePayload (options: Options) (files: CodeFile list) =
         role = "system"
         content =
             $"You have to rewrite code in {options.TargetLang} using the source in {options.SourceLang} as example." + principlesPart + "User input is JSON. Always respond with complete, unabridged answers. What you respond with is the final result. Do not simplify for brevity.
-            Respond using the following format (zero or more files, feel free to change filenames, or create new files), provide no comments besides it:
-```relative/path/to/write.cs
+            Respond using the following format (zero or more files, feel free to change filenames, or create new files, or change them again if not finished before), provide no comments besides it:
+````relative/path/to/write.cs
 the source code to write to file write.cs
-```
-```relative/path/to/write2.cs
+````
+````relative/path/to/write2.cs
 the source code to write to file write2.cs
-```
+````
 "
     }
     
@@ -220,13 +220,13 @@ the source code to write to file write2.cs
 
     {
         model = options.Model
-        messages = [systemMessage; userMessage]
+        messages = userMessage :: systemMessage :: history
         temperature = globalTemperature
         max_tokens = maxTokensGlobal
         stream = false
     }
 
-let sendRequest options payload =
+let sendRequest (options: Options) (payload: ChatRequest) =
     async {
         use client = new HttpClient()
         client.Timeout <- TimeSpan.FromMinutes(globalTimeoutMinutes)
@@ -234,7 +234,9 @@ let sendRequest options payload =
         
         let jsOptions = JsonSerializerOptions()
         jsOptions.DefaultIgnoreCondition <- JsonIgnoreCondition.WhenWritingNull
-        let json = JsonSerializer.Serialize(payload, jsOptions)
+        
+        let payload' = { payload with messages = List.rev payload.messages }
+        let json = JsonSerializer.Serialize(payload', jsOptions)
         
         let content = new StringContent(json, Encoding.UTF8, "application/json")
         
@@ -255,7 +257,7 @@ let sendRequest options payload =
         return responseContent
     }
     
-let getResponseContent (rawResponse: string) =
+let getMessage (rawResponse: string) =
     try
         use jsonDoc = JsonDocument.Parse(rawResponse)
         let root = jsonDoc.RootElement
@@ -266,35 +268,35 @@ let getResponseContent (rawResponse: string) =
             
             match firstChoice.TryGetProperty("message") with
             | (true, message) ->
-                match message.TryGetProperty("content") with
-                | (true, content) when content.ValueKind = JsonValueKind.String ->
-                    Some(content.GetString())
+                match message.TryGetProperty("content"), message.TryGetProperty("role") with
+                | (true, content), (true, role) ->
+                    Some { content = content.GetString(); role = role.GetString() } // Adjust this to match your ChatMessage type
                 | _ -> 
-                    printfn "Invalid response: missing content"
+                    printfn "Invalid response: missing content or role"
                     None
             | _ -> 
                 printfn "Invalid response: missing message"
                 None
         | _ -> 
-            printfn "Invalid response: missing choices"
+            printfn "Invalid response: missing choices or choices is empty"
             None
     with ex ->
         printfn $"Error parsing response: {ex.Message}"
         None
-
-let parseListResponse (rawResponse: string) =
-    getResponseContent rawResponse
-    |> Option.map (fun contentStr ->
-        contentStr.Split([|'\n'; '\r'|], StringSplitOptions.RemoveEmptyEntries)
+        
+let parseListResponse (message: ChatMessage option) =
+    message   
+    |> Option.map (fun message ->
+        message.content.Split([|'\n'; '\r'|], StringSplitOptions.RemoveEmptyEntries)
         |> Array.map (fun s -> s.Trim())
         |> Array.filter (System.String.IsNullOrWhiteSpace >> not)
         |> Array.toList
     )
     
-let parseRewriteResponse (rawResponse: string) =
-    getResponseContent rawResponse
-    |> Option.bind (fun contentStr ->
-        let lines = contentStr.Split('\n')
+let parseRewriteResponse (message: ChatMessage option) =
+    message
+    |> Option.bind (fun message ->
+        let lines = message.content.Split('\n')
         let mutable currentPath = None
         let mutable currentContent = []
         let mutable files = []
@@ -302,13 +304,13 @@ let parseRewriteResponse (rawResponse: string) =
             match currentPath with
             | None ->
                 let trimmedLine = line.TrimStart()
-                if trimmedLine.StartsWith("```") then
-                    let pathPart = trimmedLine.[3..].Trim()  // Remove leading ``` and trim
+                if trimmedLine.StartsWith("````") then
+                    let pathPart = trimmedLine.[4..].Trim()  // Remove leading ```` and trim
                     currentPath <- Some(pathPart)
                     currentContent <- []
             | Some(path) ->
                 let trimmedLine = line.Trim()
-                if trimmedLine.StartsWith("```") then
+                if trimmedLine.StartsWith("````") then
                     let content = currentContent |> List.rev |> String.concat Environment.NewLine
                     files <- { path = path; content = content } :: files
                     currentPath <- None
@@ -317,17 +319,23 @@ let parseRewriteResponse (rawResponse: string) =
                     currentContent <- line :: currentContent
         Some (List.rev files)
     )
-        
 
 let writeOutputFile (targetPath: string) (file: CodeFile) =
-    let fullPath = Path.Combine(targetPath, file.path)
-    let directory = Path.GetDirectoryName(fullPath)
-    
-    if not (String.IsNullOrEmpty(directory)) then
-        Directory.CreateDirectory(directory) |> ignore
-    
-    File.WriteAllText(fullPath, file.content)
-    printfn $"Written: {file.path}"
+    let targetDir = Path.GetFullPath(targetPath)
+    let targetDirNormalized =
+        if not (targetDir.EndsWith(Path.DirectorySeparatorChar.ToString())) then
+            targetDir + string Path.DirectorySeparatorChar
+        else
+            targetDir
+    let combinedPath = Path.Combine(targetDir, file.path)
+    let fullFilePath = Path.GetFullPath(combinedPath)
+    let targetUri = Uri(targetDirNormalized)
+    let fileUri = Uri(fullFilePath)
+    if not (targetUri.IsBaseOf(fileUri)) then
+        raise (ArgumentException $"The file path '%s{fullFilePath}' is outside the target directory '%s{targetDir}'.")
+    else
+        Directory.CreateDirectory(Path.GetDirectoryName(fullFilePath)) |> ignore
+        File.WriteAllText(fullFilePath, file.content)
 
 let parseCommandLine (args: string[]) =
     let rec parseInternal (args: string list) (options: Options) =
@@ -356,18 +364,25 @@ let parseCommandLine (args: string[]) =
     
     parseInternal (args |> Array.toList) defaultOptions
 
-let queryRelevantFormats (options: Options) =
+let combineHistory (maybeMessage: ChatMessage option) (history: ChatMessage list) =
+    match maybeMessage with
+    | Some value -> value :: history
+    | None -> history
+
+let queryRelevantFormatsWithHistoryAsync (options: Options) (history: ChatMessage list) = async {
     printfn "\n=== Querying relevant file formats ==="
-    let payload = createFormatQueryPayload options
-    let response = sendRequest options payload |> Async.RunSynchronously
-    parseListResponse response
+    let payload = createFormatQueryPayload options history
+    let! response = sendRequest options payload
+    let message = getMessage response
+    return (parseListResponse message, combineHistory message history)
+}
 
 let printBatch list =
     printfn $"=== Batch ==="
     list 
     |> List.iter (fun file -> printfn $"  - {file.path}")
 
-let filterImportantFiles options allFiles =
+let filterImportantFilesWithHistoryAsync (options: Options) (allFiles: CodeFile list) (history: ChatMessage List) = async {
     printfn "\n=== Filtering important files ==="
     let batchSize = batchSizeGlobal
     let batches = 
@@ -375,43 +390,52 @@ let filterImportantFiles options allFiles =
         |> List.chunkBySize batchSize
 
     let mutable importantFiles = Set.empty
+    let mutable filteringHistory = history
+    
     for batch in batches do
         printfn $"Analyzing batch of {batch.Length} files..."
         printBatch batch
-        let payload = createAnalysisPayload options batch
-        let response = sendRequest options payload |> Async.RunSynchronously
-        
-        match parseListResponse response with
-        | Some results -> 
+        let payload = createAnalysisPayload options batch filteringHistory
+        let! response = sendRequest options payload
+        let message = getMessage response
+        filteringHistory <- combineHistory message filteringHistory
+
+        match parseListResponse message with
+        | Some results ->
             importantFiles <- Set.union importantFiles (results |> Set.ofList)
             printfn $"Found {results.Length} important files in this batch (Total: {importantFiles.Count})"
         | None -> 
             printfn "No important files identified in this batch"
         
-    allFiles
+    let files =
+        allFiles
         |> List.filter (fun file -> Set.contains file.path importantFiles)
+        
+    return (files, filteringHistory)
+}
 
-let rewriteFiles (options: Options) (files: CodeFile list)  =
+let rewriteFilesWithHistoryAsync (options: Options) (files: CodeFile list) (history: ChatMessage list)  = async {
     printfn $"\nProcessing {files.Length} files..."
     try
-        let payload = createRewritePayload options files
-        let response = sendRequest options payload |> Async.RunSynchronously
-        
-        match parseRewriteResponse response with
+        let payload = createRewritePayload options files history
+        let! response = sendRequest options payload
+        let message = getMessage response
+        match parseRewriteResponse message with
         | Some results ->
             printfn $"Successfully converted {results.Length} files"
-            Some results
+            return (Some results, combineHistory message history)
         | None ->
             printfn "No valid conversion returned for these files"
-            None
+            return (None, history)
     with ex ->
         printfn $"Error processing files: {ex.Message}, {ex.StackTrace}"
-        None
+        return (None, history)
+}
 
-let runConversion (options: Options) =
+let runConversion (options: Options) (history: ChatMessage List) = async {
     try
         printfn $"Determining relevant file formats for {options.SourceLang} -> {options.TargetLang} conversion"
-        let relevantFormatsList = queryRelevantFormats options
+        let! (relevantFormatsList, formatsHistory) = queryRelevantFormatsWithHistoryAsync options history
         let relevantFormats = match relevantFormatsList with Some f -> String.Join(", ", f) | None -> "All files"
         printfn $"Relevant formats: {relevantFormats}"
 
@@ -419,8 +443,7 @@ let runConversion (options: Options) =
         let allSourceFiles = readSourceFiles options.SourcePath relevantFormatsList
         printfn $"Found {allSourceFiles.Length} relevant files to process"
 
-        // Filter to get only important files
-        let importantFiles = filterImportantFiles options allSourceFiles
+        let! (importantFiles, importantFilesHistory) = filterImportantFilesWithHistoryAsync options allSourceFiles formatsHistory
         printfn $"Identified {importantFiles.Length} important files to convert"
 
         Directory.CreateDirectory(options.TargetPath) |> ignore
@@ -432,27 +455,30 @@ let runConversion (options: Options) =
             importantFiles 
             |> List.chunkBySize batchSize
 
+        let mutable writingHistory = importantFilesHistory
         for batch in batches do
             printBatch batch
-            match rewriteFiles options batch with
-            | Some results ->
+            match! rewriteFilesWithHistoryAsync options batch writingHistory with
+            | (Some results, newHistory) ->
+                writingHistory <- newHistory
                 results |> List.iter (fun result ->
                     writeOutputFile options.TargetPath result
                     successCount <- successCount + 1
                 )
-            | None -> ()
+            | None, _ -> ()
 
         printfn $"\nConversion complete. Successfully converted {successCount} of {importantFiles.Length} important files"
-        0
+        return 0
     with
     | :? OperationCanceledException as ex ->
         Console.ForegroundColor <- ConsoleColor.Red
         printfn $"\nTask cancelled: {ex.Message}"
         Console.ResetColor()
-        1
+        return 1
     | ex ->
         printfn $"\nError: %s{ex.Message}"
-        1
+        return 1
+}
 
 [<EntryPoint>]
 let main argv =
@@ -479,7 +505,7 @@ let main argv =
             if String.IsNullOrEmpty(options.ServerUrl) then failwith "Server URL is required"
             if String.IsNullOrEmpty(options.Model) then failwith "LLM Model is required"
 
-            runConversion options
+            runConversion options [] |> Async.RunSynchronously
     with
     | ex ->
         printfn $"Error: {ex.Message}"
