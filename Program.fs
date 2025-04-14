@@ -11,8 +11,8 @@ open System.Text.Json.Serialization
 let modelGlobal = "deepseek-chat"
 let batchSizeGlobal = 30
 let maxTokensGlobal = 8_192
-let globalTimeoutMinutes = 5;
-let globalTemperature = 1.8
+let globalTimeoutMinutes = 15;
+let globalTemperature = 0
 
 type FileData = {
     filename: string
@@ -225,7 +225,7 @@ let readSourceFiles (sourcePath: string) (allowedFormats: string list option) =
     else
         failwith "Source path does not exist"
 
-let createFormatQueryPayload (sourceLang: string) (targetLang: string) (useJsonSchema: bool) =
+let createFormatQueryPayload (sourceLang: string) (targetLang: string) (principles: string) (useJsonSchema: bool) =
     let systemMessage = {
         role = "system"
         content = "Keep the dot, strip whitespace. Response must be JSON with this exact structure: {\"formats\": [\".ext1\", \".ext2\"]}"
@@ -233,7 +233,7 @@ let createFormatQueryPayload (sourceLang: string) (targetLang: string) (useJsonS
 
     let userMessage = {
         role = "user"
-        content = $"List all file extensions are used when writing apps using {sourceLang} OR {targetLang}, ignore binary files"
+        content = $"List all file extensions are used when writing apps using {sourceLang} OR {targetLang}, ignore binary files. Also, these are the conversion principles as specified by the User: " + principles
     }
 
     let responseFormat = 
@@ -482,9 +482,9 @@ let parseCommandLine (args: string[]) =
     
     parseInternal (args |> Array.toList) defaultOptions
 
-let queryRelevantFormats serverUrl apiKey sourceLang targetLang useJsonSchema =
+let queryRelevantFormats serverUrl apiKey sourceLang targetLang principles useJsonSchema =
     printfn "\n=== Querying relevant file formats ==="
-    let payload = createFormatQueryPayload sourceLang targetLang useJsonSchema
+    let payload = createFormatQueryPayload sourceLang targetLang principles useJsonSchema
     let response = sendRequest serverUrl apiKey payload |> Async.RunSynchronously
     parseFormatsResponse response
 
@@ -544,8 +544,9 @@ let rewriteFiles serverUrl apiKey (context: AnalysisContext) (files: CodeFile li
 let runConversion (options: Options) =
     try
         let useJsonSchema = options.UseJsonSchema |> Option.defaultValue false
+        let principles = options.Principles |> Option.defaultValue "None"
         printfn $"Determining relevant file formats for {options.SourceLang} -> {options.TargetLang} conversion"
-        let relevantFormatsList = queryRelevantFormats options.ServerUrl options.ApiKey options.SourceLang options.TargetLang useJsonSchema
+        let relevantFormatsList = queryRelevantFormats options.ServerUrl options.ApiKey options.SourceLang options.TargetLang principles useJsonSchema
         let relevantFormats = match relevantFormatsList with Some f -> String.Join(", ", f) | None -> "All files"
         printfn $"Relevant formats: {relevantFormats}"
 
