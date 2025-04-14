@@ -14,34 +14,6 @@ let maxTokensGlobal = 8_192
 let globalTimeoutMinutes = 15;
 let globalTemperature = 0
 
-type FileData = {
-    filename: string
-    source: string
-}
-
-type JsonSchema = {
-    ``type``: string
-    properties: Map<string, JsonSchema> option
-    required: string list option
-}
-
-type JsonSchemaWrapper = {
-    name: string
-    strict: string
-    schema: JsonSchema
-}
-
-type ResponseFormatType =
-    | JsonObject
-    | JsonSchema of JsonSchemaWrapper
-
-type ResponseFormat = {
-    [<JsonPropertyName("type")>]
-    ``type``: string
-    [<JsonPropertyName("json_schema")>]
-    json_schema: JsonSchemaWrapper option
-}
-
 type ChatMessage = {
     role: string
     content: string
@@ -53,7 +25,6 @@ type ChatRequest = {
     temperature: float
     max_tokens: int
     stream: bool
-    response_format: ResponseFormat option
 }
 
 type CodeFile = {
@@ -62,7 +33,7 @@ type CodeFile = {
 }
 
 type AnalysisContext = {
-    files: FileData list
+    files: CodeFile list
     sourceLang: string
     targetLang: string
     principles: string option
@@ -76,56 +47,7 @@ type Options = {
     ServerUrl: string
     Principles: string option
     ApiKey: string option
-    UseJsonSchema: bool option
 }
-
-let createResponseFormat (formatType: ResponseFormatType) =
-    match formatType with
-    | JsonObject ->
-        {
-            ``type`` = "json_object"
-            json_schema = None
-        }
-    | JsonSchema schema ->
-        {
-            ``type`` = "json_schema"
-            json_schema = Some schema
-        }
-
-let createFileObjectSchema() =
-    {
-        ``type`` = "object"
-        properties = Some (Map [
-            ("filename", { 
-                ``type`` = "string"
-                properties = None
-                required = None 
-            })
-            ("source", { 
-                ``type`` = "string"
-                properties = None
-                required = None 
-            })
-        ])
-        required = Some ["filename"; "source"]
-    }
-
-let createFilesResponseSchema() =
-    {
-        name = "files_response"
-        strict = "true"
-        schema = {
-            ``type`` = "object"
-            properties = Some (Map [
-                ("files", {
-                    ``type`` = "array"
-                    properties = None
-                    required = None
-                })
-            ])
-            required = Some ["files"]
-        }
-    }
 
 let isBinaryFile (filePath: string) =
     try
@@ -186,6 +108,7 @@ let isBinaryFile (filePath: string) =
                 | _ -> false)
     with
     | _ -> true
+
 let readSourceFiles (sourcePath: string) (allowedFormats: string list option) =
     let getRelativePath (filePath: string) =
         if Directory.Exists sourcePath then
@@ -193,10 +116,10 @@ let readSourceFiles (sourcePath: string) (allowedFormats: string list option) =
         else
             Path.GetFileName(filePath)
 
-    let filterByFormat (files: string array) =
+    let filterByFormat (files: string list) =
         match allowedFormats with
         | Some formats ->
-            files |> Array.filter (fun f ->
+            files |> List.filter (fun f ->
                 formats |> List.exists (fun ext ->
                     f.EndsWith(ext, StringComparison.OrdinalIgnoreCase)
                 ))
@@ -204,31 +127,37 @@ let readSourceFiles (sourcePath: string) (allowedFormats: string list option) =
 
     if Directory.Exists sourcePath then
         Directory.GetFiles(sourcePath, "*", SearchOption.AllDirectories)
-        |> Array.filter (isBinaryFile >> not)
+        |> Array.toList  // Convert array to list
+        |> List.filter (isBinaryFile >> not)
         |> filterByFormat
-        |> Array.map (fun filePath -> 
+        |> List.map (fun filePath -> 
             let relativePath = getRelativePath filePath
             let content = File.ReadAllText(filePath)
             { path = relativePath; content = content })
     elif File.Exists sourcePath then
         if isBinaryFile sourcePath then
-            [||]
+            []
         else
             let shouldInclude = 
                 match allowedFormats with
                 | Some formats -> formats |> List.exists (fun ext -> sourcePath.EndsWith(ext, StringComparison.OrdinalIgnoreCase))
                 | None -> true
             if shouldInclude then
-                [| { path = getRelativePath sourcePath; content = File.ReadAllText(sourcePath) } |]
+                [ { path = getRelativePath sourcePath; content = File.ReadAllText(sourcePath) } ]
             else
-                [||]
+                []
     else
         failwith "Source path does not exist"
 
-let createFormatQueryPayload (sourceLang: string) (targetLang: string) (principles: string) (useJsonSchema: bool) =
+let createFormatQueryPayload (sourceLang: string) (targetLang: string) (principles: string) =
     let systemMessage = {
         role = "system"
-        content = "Keep the dot, strip whitespace. Response must be JSON with this exact structure: {\"formats\": [\".ext1\", \".ext2\"]}"
+        content = "Keep the dot, strip whitespace. Do not add anything else, just formats. Response must be newline (\\n) separated list of formats. End with the newline.
+        Sample:
+.format1
+.format2
+.exe
+.cs"
     }
 
     let userMessage = {
@@ -236,69 +165,39 @@ let createFormatQueryPayload (sourceLang: string) (targetLang: string) (principl
         content = $"List all file extensions are used when writing apps using {sourceLang} OR {targetLang}, ignore binary files. Also, these are the conversion principles as specified by the User: " + principles
     }
 
-    let responseFormat = 
-        if useJsonSchema then
-            Some (createResponseFormat (JsonSchema {
-                name = "formats_response"
-                strict = "true"
-                schema = {
-                    ``type`` = "object"
-                    properties = Some (Map [
-                        ("formats", {
-                            ``type`` = "array"
-                            properties = None
-                            required = None
-                        })
-                    ])
-                    required = Some ["formats"]
-                }
-            }))
-        else
-            Some (createResponseFormat JsonObject)
-
     {
         model = modelGlobal
         messages = [systemMessage; userMessage]
         temperature = globalTemperature
         max_tokens = maxTokensGlobal
         stream = false
-        response_format = responseFormat
     }
 
-let createAnalysisPayload (files: CodeFile list) (useJsonSchema: bool) =
+let createAnalysisPayload (files: CodeFile list) =
     let systemMessage = {
         role = "system"
-        content = "Analyze these code files and identify which ones are important for the codebase. Respond with a valid JSON object containing a 'files' array with objects acknowledging only the important files that need to be rewritten. Each object should have 'filename' and 'source' fields. Source should be set as \"ok\" for important files."
+        content = "Analyze these code files and identify which ones are important when rewriting it to another language.
+        You have to Respond with a newline (\\n) separated list of such filenames. Provide no other data, just filenames.
+        Add a newline to the end of a list. Input is JSON, { files = [ { filename, source }, ... ] }"
     }
 
-    let fileDataList = 
-        files 
-        |> List.map (fun f -> { filename = f.path; source = f.content })
-
     let userContent = 
-        JsonSerializer.Serialize({| files = fileDataList |}, JsonSerializerOptions(WriteIndented = true))
+        JsonSerializer.Serialize({| files = files |}, JsonSerializerOptions(WriteIndented = true))
 
     let userMessage = {
         role = "user"
         content = userContent
     }
 
-    let responseFormat = 
-        if useJsonSchema then
-            Some (createResponseFormat (JsonSchema (createFilesResponseSchema())))
-        else
-            Some (createResponseFormat JsonObject)
-
     {
         model = modelGlobal
         messages = [systemMessage; userMessage]
         temperature = globalTemperature
         max_tokens = maxTokensGlobal
         stream = false
-        response_format = responseFormat
     }
 
-let createRewritePayload (files: CodeFile list) (context: AnalysisContext) (useJsonSchema: bool) =
+let createRewritePayload (files: CodeFile list) (context: AnalysisContext) =
     let principlesPart = 
         context.principles 
         |> Option.map (fun p -> $"Follow these mandatory principles: {p}.")
@@ -307,23 +206,23 @@ let createRewritePayload (files: CodeFile list) (context: AnalysisContext) (useJ
     let systemMessage = {
         role = "system"
         content =
-            $"You have to rewrite code in {context.targetLang} using the source in {context.sourceLang} as example." + principlesPart + "User input is JSON. Always respond with complete, unabridged answers. What you respond with is the final result. Do not simplify for brevity. You must respond with a valid JSON object containing a 'files' array with objects having 'filename' and 'source' fields. Rewrite the code as requested. It is ok to ignore some files and change filenames and create many files instead of one or many source files when it makes sense. The response MUST be valid JSON with this exact structure: {\"files\": [{\"filename\": \"target/path.ext\", \"source\": \"rewritten code\"}, ...]}"
+            $"You have to rewrite code in {context.targetLang} using the source in {context.sourceLang} as example." + principlesPart + "User input is JSON. Always respond with complete, unabridged answers. What you respond with is the final result. Do not simplify for brevity.
+            Respond using the following format (zero or more files, feel free to change filenames, or create new files), provide no comments besides it:
+```relative/path/to/write.cs
+the source code to write to file write.cs
+```
+```relative/path/to/write2.cs
+the source code to write to file write2.cs
+```
+"
     }
-
-    let fileDataList = files |> List.map (fun f -> { filename = f.path; source = f.content })
     
-    let userContent = JsonSerializer.Serialize({| files = fileDataList |})
+    let userContent = JsonSerializer.Serialize({| files = files |})
 
     let userMessage = {
         role = "user"
         content = userContent
     }
-
-    let responseFormat = 
-        if useJsonSchema then
-            Some (createResponseFormat (JsonSchema (createFilesResponseSchema())))
-        else
-            Some (createResponseFormat JsonObject)
 
     {
         model = modelGlobal
@@ -331,7 +230,6 @@ let createRewritePayload (files: CodeFile list) (context: AnalysisContext) (useJ
         temperature = globalTemperature
         max_tokens = maxTokensGlobal
         stream = false
-        response_format = responseFormat
     }
 
 let sendRequest (serverUrl: string) (apiKey: string option) (payload: ChatRequest) =
@@ -362,10 +260,10 @@ let sendRequest (serverUrl: string) (apiKey: string option) (payload: ChatReques
         printfn $"Received response: {responseContent}"
         return responseContent
     }
-
-let parseFormatsResponse (responseContent: string) =
+    
+let getResponseContent (rawResponse: string) =
     try
-        use jsonDoc = JsonDocument.Parse(responseContent)
+        use jsonDoc = JsonDocument.Parse(rawResponse)
         let root = jsonDoc.RootElement
         
         match root.TryGetProperty("choices") with
@@ -376,62 +274,7 @@ let parseFormatsResponse (responseContent: string) =
             | (true, message) ->
                 match message.TryGetProperty("content") with
                 | (true, content) when content.ValueKind = JsonValueKind.String ->
-                    let contentStr = content.GetString()
-                    try
-                        let parsed = JsonDocument.Parse(contentStr).RootElement
-                        match parsed.TryGetProperty("formats") with
-                        | (true, formats) when formats.ValueKind = JsonValueKind.Array ->
-                            let results = JsonSerializer.Deserialize<string list>(formats.GetRawText())
-                            if List.isEmpty results then
-                                printfn "No formats specified, will process all files"
-                                None
-                            else
-                                Some results
-                        | _ ->
-                            printfn "No formats array found in response"
-                            None
-                    with ex ->
-                        printfn $"Failed to deserialize formats response: {ex.Message}"
-                        None
-                | _ -> 
-                    printfn "Invalid response: missing content"
-                    None
-            | _ -> 
-                printfn "Invalid response: missing message"
-                None
-        | _ -> 
-            printfn "Invalid response: missing choices"
-            None
-    with ex ->
-        printfn $"Error parsing formats response: {ex.Message}"
-        None
-
-let parseResponse (responseContent: string) =
-    try
-        use jsonDoc = JsonDocument.Parse(responseContent)
-        let root = jsonDoc.RootElement
-        
-        match root.TryGetProperty("choices") with
-        | (true, choices) when choices.ValueKind = JsonValueKind.Array && choices.GetArrayLength() > 0 ->
-            let firstChoice = choices[0]
-            
-            match firstChoice.TryGetProperty("message") with
-            | (true, message) ->
-                match message.TryGetProperty("content") with
-                | (true, content) when content.ValueKind = JsonValueKind.String ->
-                    let contentStr = content.GetString()
-                    try
-                        let parsed = JsonDocument.Parse(contentStr).RootElement
-                        match parsed.TryGetProperty("files") with
-                        | (true, files) when files.ValueKind = JsonValueKind.Array ->
-                            let results = JsonSerializer.Deserialize<FileData list>(files.GetRawText())
-                            Some results
-                        | _ ->
-                            printfn "Invalid response: missing files array"
-                            None
-                    with ex ->
-                        printfn $"Failed to deserialize response: {ex.Message}"
-                        None
+                    Some(content.GetString())
                 | _ -> 
                     printfn "Invalid response: missing content"
                     None
@@ -445,15 +288,52 @@ let parseResponse (responseContent: string) =
         printfn $"Error parsing response: {ex.Message}"
         None
 
-let writeOutputFile (targetPath: string) (file: FileData) =
-    let fullPath = Path.Combine(targetPath, file.filename)
+let parseListResponse (rawResponse: string) =
+    getResponseContent rawResponse
+    |> Option.map (fun contentStr ->
+        contentStr.Split([|'\n'; '\r'|], StringSplitOptions.RemoveEmptyEntries)
+        |> Array.map (fun s -> s.Trim())
+        |> Array.filter (System.String.IsNullOrWhiteSpace >> not)
+        |> Array.toList
+    )
+    
+let parseRewriteResponse (rawResponse: string) =
+    getResponseContent rawResponse
+    |> Option.bind (fun contentStr ->
+        let lines = contentStr.Split('\n')
+        let mutable currentPath = None
+        let mutable currentContent = []
+        let mutable files = []
+        for line in lines do
+            match currentPath with
+            | None ->
+                let trimmedLine = line.TrimStart()
+                if trimmedLine.StartsWith("```") then
+                    let pathPart = trimmedLine.[3..].Trim()  // Remove leading ``` and trim
+                    currentPath <- Some(pathPart)
+                    currentContent <- []
+            | Some(path) ->
+                let trimmedLine = line.Trim()
+                if trimmedLine.StartsWith("```") then
+                    let content = currentContent |> List.rev |> String.concat Environment.NewLine
+                    files <- { path = path; content = content } :: files
+                    currentPath <- None
+                    currentContent <- []
+                else
+                    currentContent <- line :: currentContent
+        Some (List.rev files)
+    )
+        
+
+let writeOutputFile (targetPath: string) (file: CodeFile) =
+    let fullPath = Path.Combine(targetPath, file.path)
     let directory = Path.GetDirectoryName(fullPath)
     
     if not (String.IsNullOrEmpty(directory)) then
         Directory.CreateDirectory(directory) |> ignore
     
-    File.WriteAllText(fullPath, file.source)
-    printfn $"Written: {file.filename}"
+    File.WriteAllText(fullPath, file.content)
+    printfn $"Written: {file.path}"
 
 let parseCommandLine (args: string[]) =
     let rec parseInternal (args: string list) (options: Options) =
@@ -466,7 +346,6 @@ let parseCommandLine (args: string[]) =
         | "--server" :: url :: rest -> parseInternal rest { options with ServerUrl = url }
         | "--principles" :: principles :: rest -> parseInternal rest { options with Principles = Some principles }
         | "--api-key" :: key :: rest -> parseInternal rest { options with ApiKey = Some key }
-        | "--use-json-schema" :: rest -> parseInternal rest { options with UseJsonSchema = Some true }
         | x :: _ -> failwith $"Unknown option: {x}"
     
     let defaultOptions = {
@@ -477,60 +356,52 @@ let parseCommandLine (args: string[]) =
         ServerUrl = ""
         Principles = None
         ApiKey = None
-        UseJsonSchema = None
     }
     
     parseInternal (args |> Array.toList) defaultOptions
 
-let queryRelevantFormats serverUrl apiKey sourceLang targetLang principles useJsonSchema =
+let queryRelevantFormats serverUrl apiKey sourceLang targetLang principles =
     printfn "\n=== Querying relevant file formats ==="
-    let payload = createFormatQueryPayload sourceLang targetLang principles useJsonSchema
+    let payload = createFormatQueryPayload sourceLang targetLang principles 
     let response = sendRequest serverUrl apiKey payload |> Async.RunSynchronously
-    parseFormatsResponse response
+    parseListResponse response
 
 let printBatch list =
     printfn $"=== Batch ==="
     list 
     |> List.iter (fun file -> printfn $"  - {file.path}")
 
-let filterImportantFiles serverUrl apiKey (allFiles: CodeFile[]) useJsonSchema =
+let filterImportantFiles serverUrl apiKey (allFiles: CodeFile list) =
     printfn "\n=== Filtering important files ==="
     let batchSize = batchSizeGlobal
     let batches = 
         allFiles 
-        |> Array.toList
         |> List.chunkBySize batchSize
 
-    let importantFiles = ResizeArray<CodeFile>()
-
+    let mutable importantFiles = Set.empty
     for batch in batches do
         printfn $"Analyzing batch of {batch.Length} files..."
         printBatch batch
-        let payload = createAnalysisPayload batch useJsonSchema
+        let payload = createAnalysisPayload batch
         let response = sendRequest serverUrl apiKey payload |> Async.RunSynchronously
         
-        match parseResponse response with
+        match parseListResponse response with
         | Some results -> 
-            let importantInBatch = 
-                results 
-                |> List.filter (fun f -> f.source = "ok")
-                |> List.map (fun f -> 
-                    batch |> List.find (fun src -> src.path = f.filename))
-            
-            importantFiles.AddRange(importantInBatch)
-            printfn $"Found {importantInBatch.Length} important files in this batch"
+            importantFiles <- Set.union importantFiles (results |> Set.ofList)
+            printfn $"Found {results.Length} important files in this batch (Total: {importantFiles.Count})"
         | None -> 
             printfn "No important files identified in this batch"
+        
+    allFiles
+        |> List.filter (fun file -> Set.contains file.path importantFiles)
 
-    importantFiles |> Seq.toArray
-
-let rewriteFiles serverUrl apiKey (context: AnalysisContext) (files: CodeFile list) useJsonSchema =
+let rewriteFiles serverUrl apiKey (context: AnalysisContext) (files: CodeFile list)  =
     printfn $"\nProcessing {files.Length} files..."
     try
-        let payload = createRewritePayload files context useJsonSchema
+        let payload = createRewritePayload files context
         let response = sendRequest serverUrl apiKey payload |> Async.RunSynchronously
         
-        match parseResponse response with
+        match parseRewriteResponse response with
         | Some results ->
             printfn $"Successfully converted {results.Length} files"
             Some results
@@ -538,15 +409,14 @@ let rewriteFiles serverUrl apiKey (context: AnalysisContext) (files: CodeFile li
             printfn "No valid conversion returned for these files"
             None
     with ex ->
-        printfn $"Error processing files: {ex.Message}"
+        printfn $"Error processing files: {ex.Message}, {ex.StackTrace}"
         None
 
 let runConversion (options: Options) =
     try
-        let useJsonSchema = options.UseJsonSchema |> Option.defaultValue false
         let principles = options.Principles |> Option.defaultValue "None"
         printfn $"Determining relevant file formats for {options.SourceLang} -> {options.TargetLang} conversion"
-        let relevantFormatsList = queryRelevantFormats options.ServerUrl options.ApiKey options.SourceLang options.TargetLang principles useJsonSchema
+        let relevantFormatsList = queryRelevantFormats options.ServerUrl options.ApiKey options.SourceLang options.TargetLang principles 
         let relevantFormats = match relevantFormatsList with Some f -> String.Join(", ", f) | None -> "All files"
         printfn $"Relevant formats: {relevantFormats}"
 
@@ -555,11 +425,11 @@ let runConversion (options: Options) =
         printfn $"Found {allSourceFiles.Length} relevant files to process"
 
         // Filter to get only important files
-        let importantFiles = filterImportantFiles options.ServerUrl options.ApiKey allSourceFiles useJsonSchema
+        let importantFiles = filterImportantFiles options.ServerUrl options.ApiKey allSourceFiles
         printfn $"Identified {importantFiles.Length} important files to convert"
 
         let context = {
-            files = importantFiles |> Array.map (fun f -> { filename = f.path; source = f.content }) |> Array.toList
+            files = importantFiles
             sourceLang = options.SourceLang
             targetLang = options.TargetLang
             principles = options.Principles
@@ -572,12 +442,11 @@ let runConversion (options: Options) =
         let batchSize = batchSizeGlobal
         let batches = 
             importantFiles 
-            |> Array.toList
             |> List.chunkBySize batchSize
 
         for batch in batches do
             printBatch batch
-            match rewriteFiles options.ServerUrl options.ApiKey context batch useJsonSchema with
+            match rewriteFiles options.ServerUrl options.ApiKey context batch with
             | Some results ->
                 results |> List.iter (fun result ->
                     writeOutputFile options.TargetPath result
@@ -610,7 +479,6 @@ let main argv =
             printfn "  --server <url>         API server URL"
             printfn "  --principles <text>    (Optional) Conversion principles"
             printfn "  --api-key <key>        (Optional) API key for authentication"
-            printfn "  --use-json-schema      (Optional) Use JSON Schema"
             1
         else
             let options = parseCommandLine argv
@@ -625,4 +493,4 @@ let main argv =
     with
     | ex ->
         printfn $"Error: {ex.Message}"
-        1
+        2
