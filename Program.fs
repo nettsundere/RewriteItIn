@@ -1,6 +1,5 @@
 ﻿open System
 open System.Buffers
-open System.Buffers.Binary
 open System.IO
 open System.Net
 open System.Net.Http
@@ -8,15 +7,8 @@ open System.Numerics
 open System.Text
 open System.Text.Json
 open System.Text.Json.Serialization
+open System.Threading
 open Microsoft.FSharp.Control
-
-let batchSizeGlobal = 30
-let maxTokensGlobal = 8_192
-let globalTimeoutMinutes = 15
-let globalTemperature = 1.3
-let historyLimitGlobal = 25
-let fileSizeLimitGlobal = 1024 * 50_000
-let conversionRetriesGlobal = 3
 
 type ChatMessage = {
     role: string
@@ -43,6 +35,13 @@ type Options = {
     TargetLang: string
     ServerUrl: string
     Model: string
+    BatchSize: int
+    MaxTokens: int
+    Temperature: float
+    HistoryLimit: int
+    FileSizeLimitBytes: int
+    ConversionRetries: int
+    TimeoutMinutes: int
     Principles: string option
     ApiKey: string option
 }
@@ -102,13 +101,13 @@ let shuffle (rng: Random) (list: 'a list) =
         arr.[j] <- tmp
     Array.toList arr
     
-let readSourceFiles (sourcePath: string) (allowedFormats: string list option) =
+let readSourceFiles (options: Options) (allowedFormats: string list option) =
     let ensureTrailingSlash (path: string) =
         if not (path.EndsWith(Path.DirectorySeparatorChar)) then path + string Path.DirectorySeparatorChar
         else path
 
     let sourceUri = 
-        Path.GetFullPath(sourcePath)
+        Path.GetFullPath(options.SourcePath)
         |> ensureTrailingSlash
         |> fun p -> Uri(p, UriKind.Absolute)
 
@@ -135,13 +134,13 @@ let readSourceFiles (sourcePath: string) (allowedFormats: string list option) =
 
     let readFileContent filePath =
         { 
-            path = if Directory.Exists sourcePath 
+            path = if Directory.Exists options.SourcePath 
                    then getRelativePath filePath 
                    else Path.GetFileName(filePath)
             content = File.ReadAllText(filePath) 
         }
 
-    let isNotTooBig file = FileInfo(file).Length < fileSizeLimitGlobal
+    let isNotTooBig file = FileInfo(file).Length < options.FileSizeLimitBytes
     
     let processDirectory () =
         try
@@ -156,13 +155,13 @@ let readSourceFiles (sourcePath: string) (allowedFormats: string list option) =
         | :? DirectoryNotFoundException -> []
 
     let processSingleFile () =
-        let fileUri = toUri sourcePath
+        let fileUri = toUri options.SourcePath
         if not (sourceUri.IsBaseOf(fileUri)) then
             []
-        elif isBinaryFile sourcePath || not (extensionAllowed sourcePath) then 
+        elif isBinaryFile options.SourcePath || not (extensionAllowed options.SourcePath) then 
             []
         else 
-            [readFileContent sourcePath]
+            [readFileContent options.SourcePath]
 
     if Directory.Exists sourceUri.LocalPath then
         processDirectory ()
@@ -198,8 +197,8 @@ let createFormatQueryPayload (options: Options) (history: ChatMessage list) =
     {
         model = options.Model
         messages = combineMessagesForHistory systemMessage userMessage history 
-        temperature = globalTemperature
-        max_tokens = maxTokensGlobal
+        temperature = options.Temperature
+        max_tokens = options.MaxTokens
         stream = false
     }
 
@@ -222,8 +221,8 @@ let createAnalysisPayload (options: Options) (files: CodeFile list) (history: Ch
     {
         model = options.Model
         messages = combineMessagesForHistory systemMessage userMessage history 
-        temperature = globalTemperature
-        max_tokens = maxTokensGlobal
+        temperature = options.Temperature
+        max_tokens = options.MaxTokens
         stream = false
     }
 
@@ -257,8 +256,8 @@ the source code to write to file write2.cs
     {
         model = options.Model
         messages = combineMessagesForHistory systemMessage userMessage history 
-        temperature = globalTemperature
-        max_tokens = maxTokensGlobal
+        temperature = options.Temperature
+        max_tokens = options.MaxTokens
         stream = false
     }
     
@@ -283,9 +282,9 @@ let truncateHistoryShuffle (messages: ChatMessage list) (historyLimit: int) =
 module HttpClientSingleton =    
     let private createClient() =
         let client = new HttpClient()
-        client.Timeout <- TimeSpan.FromMinutes(globalTimeoutMinutes)
+        client.Timeout <- Timeout.InfiniteTimeSpan
         client
-    
+        
     let Instance = lazy(createClient())
 
 let sendRequest (options: Options) (payload: ChatRequest) =
@@ -313,7 +312,8 @@ let sendRequest (options: Options) (payload: ChatRequest) =
 
             try
                 let client = HttpClientSingleton.Instance.Value
-                let! response = client.SendAsync(request) |> Async.AwaitTask
+                use cts = new CancellationTokenSource(TimeSpan.FromMinutes(options.TimeoutMinutes))
+                let! response = client.SendAsync(request, cts.Token) |> Async.AwaitTask
                 
                 if response.StatusCode = HttpStatusCode.BadRequest && currentLimit >= 2 then
                     let newLimit = currentLimit / 2
@@ -336,7 +336,7 @@ let sendRequest (options: Options) (payload: ChatRequest) =
                 return raise ex
         }
     
-    retryWithReducedHistory historyLimitGlobal
+    retryWithReducedHistory options.HistoryLimit
 
 let getMessage (rawResponse: string) =
     try
@@ -428,6 +428,13 @@ let parseCommandLine (args: string[]) =
         | "--target-lang" :: lang :: rest -> parseInternal rest { options with TargetLang = lang }
         | "--server" :: url :: rest -> parseInternal rest { options with ServerUrl = url }
         | "--model" :: model :: rest -> parseInternal rest { options with Model = model }
+        | "--batch-size" :: size :: rest -> parseInternal rest { options with BatchSize = int size }
+        | "--max-tokens" :: tokens :: rest -> parseInternal rest { options with MaxTokens = int tokens }
+        | "--temperature" :: temp :: rest -> parseInternal rest { options with Temperature = float temp }
+        | "--history-limit" :: limit :: rest -> parseInternal rest { options with HistoryLimit = int limit }
+        | "--file-size-limit-bytes" :: limit :: rest -> parseInternal rest { options with FileSizeLimitBytes = int limit }
+        | "--conversion-retries" :: retries :: rest -> parseInternal rest { options with ConversionRetries = int retries }
+        | "--timeout-minutes" :: timeoutMinutes :: rest -> parseInternal rest { options with TimeoutMinutes = int timeoutMinutes }
         | "--principles" :: principles :: rest -> parseInternal rest { options with Principles = Some principles }
         | "--api-key" :: key :: rest -> parseInternal rest { options with ApiKey = Some key }
         | x :: _ -> failwith $"Unknown option: {x}"
@@ -439,6 +446,13 @@ let parseCommandLine (args: string[]) =
         TargetLang = ""
         ServerUrl = ""
         Model = ""
+        BatchSize = 30
+        MaxTokens = 8192
+        Temperature = 1.3
+        HistoryLimit = 25
+        FileSizeLimitBytes = 1024 * 50_000
+        ConversionRetries = 3
+        TimeoutMinutes = 25
         Principles = None
         ApiKey = None
     }
@@ -460,7 +474,7 @@ let printBatch list =
 
 let filterImportantFilesWithHistoryAsync (options: Options) (allFiles: CodeFile list) (history: ChatMessage List) = async {
     printfn "\n=== Filtering important files ==="
-    let batchSize = batchSizeGlobal
+    let batchSize = options.BatchSize
     let batches = 
         allFiles 
         |> List.chunkBySize batchSize
@@ -527,7 +541,7 @@ let rewriteBatchWithRetryAsync (options: Options) (batch: CodeFile list) (histor
 }
 
 let rewriteFilesInBatchesWithRetryAsync (options: Options) (files: CodeFile list) (initialHistory: ChatMessage list) (maxRetries: int) = async {
-    let batchSize = batchSizeGlobal
+    let batchSize = options.BatchSize
     let batches = files |> List.chunkBySize batchSize
     let mutable successCount = 0
     let mutable currentHistory = initialHistory
@@ -555,7 +569,7 @@ let runConversion (options: Options) (history: ChatMessage List) = async {
         printfn $"Relevant formats: {relevantFormats}"
 
         printfn $"Reading source files from %s{options.SourcePath}"
-        let allSourceFiles = readSourceFiles options.SourcePath relevantFormatsList
+        let allSourceFiles = readSourceFiles options relevantFormatsList
         printfn $"Found {allSourceFiles.Length} relevant files to process"
 
         let! (importantFiles, importantFilesHistory) = filterImportantFilesWithHistoryAsync options allSourceFiles formatsHistory
@@ -564,7 +578,7 @@ let runConversion (options: Options) (history: ChatMessage List) = async {
         Directory.CreateDirectory(options.TargetPath) |> ignore
         
         printfn "\n=== Starting rewrite phase ==="
-        let! (successCount, _) = rewriteFilesInBatchesWithRetryAsync options importantFiles importantFilesHistory conversionRetriesGlobal
+        let! successCount, _ = rewriteFilesInBatchesWithRetryAsync options importantFiles importantFilesHistory options.ConversionRetries
         
         printfn $"\nConversion complete. Successfully converted {successCount} of {importantFiles.Length} important files"
         return 0
@@ -585,14 +599,21 @@ let main argv =
         if argv.Length = 0 then
             printfn "Usage: dotnet run [options]"
             printfn "Options:"
-            printfn "  --source <path>        Source file or directory"
-            printfn "  --source-lang <lang>   Source language"
-            printfn "  --target <path>        Target directory"
-            printfn "  --target-lang <lang>   Target language"
-            printfn "  --server <url>         API server URL"
-            printfn "  --model <model-name>   LLM Model (like deepseek-chat)"
-            printfn "  --principles <text>    (Optional) Conversion principles"
-            printfn "  --api-key <key>        (Optional) API key for authentication"
+            printfn "  --source <path>          Source file/directory"
+            printfn "  --source-lang <lang>     Source language"
+            printfn "  --target <path>          Target directory"
+            printfn "  --target-lang <lang>     Target language"
+            printfn "  --server <url>           API server URL"
+            printfn "  --model <model>          LLM Model name"
+            printfn "  --batch-size <n>         (Optional) Files per batch (default: 30)"
+            printfn "  --max-tokens <n>         (Optional) Max response tokens (default: 8192)"
+            printfn "  --temperature <f>        (Optional) AI temperature (default: 1.3)"
+            printfn "  --history-limit <n>      (Optional) Conversation history limit (default: 25)"
+            printfn "  --file-size-limit <n>    (Optional) Max file size in bytes (default: 51200000)"
+            printfn "  --conversion-retries <n> (Optional) Conversion retries (default: 3)"
+            printfn "  --timeout-minutes <n>    (Optional) LLM API Timeout in minutes (default: 25)"
+            printfn "  --principles <text>      (Optional) Conversion principles"
+            printfn "  --api-key <key>          (Optional) API key"
             1
         else
             let options = parseCommandLine argv
