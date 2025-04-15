@@ -331,9 +331,9 @@ let sendRequest (options: Options) (payload: ChatRequest) =
                     printfn $"Received response: {responseContent}"
                     return responseContent
             with
-            | :? OperationCanceledException when currentLimit >= 2 ->
+            | ex when currentLimit >= 2 ->
                 let newLimit = currentLimit / 2
-                printfn $"Request timed out, reducing history limit from {currentLimit} to {newLimit}"
+                printfn $"Request failed {ex.Message}, {ex.StackTrace}, reducing history limit from {currentLimit} to {newLimit}"
                 return! retryWithReducedHistory newLimit
             | ex ->
                 return raise ex
