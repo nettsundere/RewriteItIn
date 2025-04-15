@@ -29,7 +29,7 @@ Options:
   --model <model>          LLM Model name
   --batch-size <n>         (Optional) Files per batch (default: 30)
   --max-tokens <n>         (Optional) Max response tokens (default: 8192)
-  --temperature <f>        (Optional) AI temperature (default: 1.3)
+  --temperature <f>        (Optional) LLM temperature (default: 1.3)
   --history-limit <n>      (Optional) Conversation history limit (default: 25)
   --file-size-limit <n>    (Optional) Max file size in bytes (default: 51200000)
   --conversion-retries <n> (Optional) Conversion retries (default: 3)
