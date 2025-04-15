@@ -14,8 +14,9 @@ let batchSizeGlobal = 30
 let maxTokensGlobal = 8_192
 let globalTimeoutMinutes = 15
 let globalTemperature = 1.3
-let historyLimitGlobal = 50
+let historyLimitGlobal = 25
 let fileSizeLimitGlobal = 2048
+let conversionRetriesGlobal = 3
 
 type ChatMessage = {
     role: string
@@ -94,7 +95,7 @@ let isBinaryFile (filePath: string) =
             (bytesRead >= 4 && 
                 let signature = BinaryPrimitives.ReadUInt32LittleEndian(span)
                 match signature with
-                | 0x46445025u  // %PDF
+                | 0x46445025u   // PDF
                 | 0x04034B50u   // ZIP
                 | 0x464C457Fu   // ELF
                 | 0x4D5A9000u   // MZ (PE)
@@ -270,8 +271,8 @@ let truncateHistoryShuffle (messages: ChatMessage list) (historyLimit: int) =
         first :: (keptMiddle @ [last])
     
 
-let sendRequest (options: Options) (payload: ChatRequest) : Async<string> =
-    let rec retryWithReducedHistory (currentLimit: int) : Async<string> =
+let sendRequest (options: Options) (payload: ChatRequest) =
+    let rec retryWithReducedHistory (currentLimit: int) =
         async {
             use client = new HttpClient()
             client.Timeout <- TimeSpan.FromMinutes(globalTimeoutMinutes)
@@ -291,19 +292,28 @@ let sendRequest (options: Options) (payload: ChatRequest) : Async<string> =
             
             printfn $"Sending request to: {url} with history limit: {currentLimit}"
 
-            let! response = client.PostAsync(url, content) |> Async.AwaitTask
-            
-            if response.StatusCode = HttpStatusCode.BadRequest && currentLimit >= 2 then
+            try
+                let! response = client.PostAsync(url, content) |> Async.AwaitTask
+                
+                if response.StatusCode = HttpStatusCode.BadRequest && currentLimit >= 2 then
+                    let newLimit = currentLimit / 2
+                    let! badRequestMessage = response.Content.ReadAsStringAsync() |> Async.AwaitTask
+                    printfn $"Bad request received {badRequestMessage}, reducing history limit from {currentLimit} to {newLimit}"
+                    return! retryWithReducedHistory newLimit
+                elif not response.IsSuccessStatusCode then
+                    let! errorContent = response.Content.ReadAsStringAsync() |> Async.AwaitTask
+                    return failwith $"Request failed with status {response.StatusCode}: {errorContent}"
+                else
+                    let! responseContent = response.Content.ReadAsStringAsync() |> Async.AwaitTask
+                    printfn $"Received response: {responseContent}"
+                    return responseContent
+            with
+            | :? OperationCanceledException when currentLimit >= 2 ->
                 let newLimit = currentLimit / 2
-                printfn $"Bad request received, reducing history limit from {currentLimit} to {newLimit}"
+                printfn $"Request timed out, reducing history limit from {currentLimit} to {newLimit}"
                 return! retryWithReducedHistory newLimit
-            elif not response.IsSuccessStatusCode then
-                let! errorContent = response.Content.ReadAsStringAsync() |> Async.AwaitTask
-                return failwith $"Request failed with status {response.StatusCode}: {errorContent}"
-            else
-                let! responseContent = response.Content.ReadAsStringAsync() |> Async.AwaitTask
-                printfn $"Received response: {responseContent}"
-                return responseContent
+            | ex ->
+                return raise ex
         }
     
     retryWithReducedHistory historyLimitGlobal
@@ -478,6 +488,45 @@ let rewriteFilesWithHistoryAsync (options: Options) (files: CodeFile list) (hist
         return (None, history)
 }
 
+
+let rewriteBatchWithRetryAsync (options: Options) (batch: CodeFile list) (history: ChatMessage list) (maxRetries: int) = async {
+    let rec retry attemptsRemaining = async {
+        try
+            let! (results, newHistory) = rewriteFilesWithHistoryAsync options batch history
+            return (results, newHistory)
+        with ex ->
+            if attemptsRemaining > 0 then
+                printfn $"Retrying batch ({maxRetries - attemptsRemaining + 1}/{maxRetries})..."
+                return! retry (attemptsRemaining - 1)
+            else
+                printfn $"Failed to rewrite batch after {maxRetries} attempts: {ex.Message}"
+                return (None, history)
+    }
+    
+    return! retry maxRetries
+}
+
+let rewriteFilesInBatchesWithRetryAsync (options: Options) (files: CodeFile list) (initialHistory: ChatMessage list) (maxRetries: int) = async {
+    let batchSize = batchSizeGlobal
+    let batches = files |> List.chunkBySize batchSize
+    let mutable successCount = 0
+    let mutable currentHistory = initialHistory
+    
+    for batch in batches do
+        printBatch batch
+        let! (results, newHistory) = rewriteBatchWithRetryAsync options batch currentHistory maxRetries
+        currentHistory <- newHistory
+        match results with
+        | Some rewrittenFiles ->
+            rewrittenFiles |> List.iter (fun result ->
+                writeOutputFile options.TargetPath result
+                successCount <- successCount + 1
+            )
+        | None -> ()
+    
+    return (successCount, currentHistory)
+}
+
 let runConversion (options: Options) (history: ChatMessage List) = async {
     try
         printfn $"Determining relevant file formats for {options.SourceLang} -> {options.TargetLang} conversion"
@@ -493,26 +542,10 @@ let runConversion (options: Options) (history: ChatMessage List) = async {
         printfn $"Identified {importantFiles.Length} important files to convert"
 
         Directory.CreateDirectory(options.TargetPath) |> ignore
-        let mutable successCount = 0
-
+        
         printfn "\n=== Starting rewrite phase ==="
-        let batchSize = batchSizeGlobal
-        let batches = 
-            importantFiles 
-            |> List.chunkBySize batchSize
-
-        let mutable writingHistory = importantFilesHistory
-        for batch in batches do
-            printBatch batch
-            match! rewriteFilesWithHistoryAsync options batch writingHistory with
-            | (Some results, newHistory) ->
-                writingHistory <- newHistory
-                results |> List.iter (fun result ->
-                    writeOutputFile options.TargetPath result
-                    successCount <- successCount + 1
-                )
-            | None, _ -> ()
-
+        let! (successCount, _) = rewriteFilesInBatchesWithRetryAsync options importantFiles importantFilesHistory conversionRetriesGlobal
+        
         printfn $"\nConversion complete. Successfully converted {successCount} of {importantFiles.Length} important files"
         return 0
     with
