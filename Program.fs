@@ -319,7 +319,6 @@ let sendRequest (options: Options) (payload: ChatRequest) =
             use request = new HttpRequestMessage(HttpMethod.Post, url)
             request.Content <- content
             
-            // Add authorization header per request
             match options.ApiKey with
             | Some key -> 
                 request.Headers.Authorization <- 
