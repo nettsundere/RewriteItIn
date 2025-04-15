@@ -31,9 +31,9 @@ Options:
   --api-key <key>        (Optional) API key for authentication
 ```
 
-### Example
+### Example (rewrite this tool itself to JAVA)
 ```bash
-dotnet run --source  ../nettsundere.github.io --source-lang HTML,CSS --target ../test/w2 --target-lang HTML,CSS,JavaScript --server https://api.deepseek.com --principles "Fix the paths, make it look modern, add missing things" --model deepseek-chat --api-key SAMPLE 
+dotnet run --source . --source-lang F# --target ../test/w12 --target-lang JAVA --server https://api.deepseek.com --principles "Create standard JAVA project structure" --model "deepseek-reasoner"  --api-key REDACTED
 ```
 
 ## License
