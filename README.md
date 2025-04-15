@@ -16,19 +16,26 @@ A code conversion tool that uses the DeepSeek v3 LLM or LM Studio API to rewrite
 ```bash
 git clone https://github.com/nettsundere/rewrite-it-in.git
 cd rewrite-it-in
-...
+```
 
 ```bash
 Usage: dotnet run [options]
 Options:
-  --source <path>        Source file or directory
-  --source-lang <lang>   Source language
-  --target <path>        Target directory
-  --target-lang <lang>   Target language
-  --server <url>         API server URL
-  --model <model-name>   LLM Model (like deepseek-chat)
-  --principles <text>    (Optional) Conversion principles
-  --api-key <key>        (Optional) API key for authentication
+  --source <path>          Source file/directory
+  --source-lang <lang>     Source language
+  --target <path>          Target directory
+  --target-lang <lang>     Target language
+  --server <url>           API server URL
+  --model <model>          LLM Model name
+  --batch-size <n>         (Optional) Files per batch (default: 30)
+  --max-tokens <n>         (Optional) Max response tokens (default: 8192)
+  --temperature <f>        (Optional) AI temperature (default: 1.3)
+  --history-limit <n>      (Optional) Conversation history limit (default: 25)
+  --file-size-limit <n>    (Optional) Max file size in bytes (default: 51200000)
+  --conversion-retries <n> (Optional) Conversion retries (default: 3)
+  --timeout-minutes <n>    (Optional) LLM API Timeout in minutes (default: 25)
+  --principles <text>      (Optional) Conversion principles
+  --api-key <key>          (Optional) API key
 ```
 
 ### Example (rewrite this tool itself to JAVA)
