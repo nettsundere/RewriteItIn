@@ -89,21 +89,7 @@ let isBinaryFile (filePath: string) =
                         
                         foundBinary
                 | _ -> false
-
-            isBinary || 
-            // Check for binary file signatures if no markers found
-            (bytesRead >= 4 && 
-                let signature = BinaryPrimitives.ReadUInt32LittleEndian(span)
-                match signature with
-                | 0x46445025u   // PDF
-                | 0x04034B50u   // ZIP
-                | 0x464C457Fu   // ELF
-                | 0x4D5A9000u   // MZ (PE)
-                | 0x474E5089u   // PNG
-                | 0x38464947u   // GIF
-                | 0x46464952u   // RIFF
-                | 0xE011CFD0u -> true  // MS Office
-                | _ -> false)
+            isBinary
     with
     | _ -> true
 
@@ -294,9 +280,7 @@ let truncateHistoryShuffle (messages: ChatMessage list) (historyLimit: int) =
             let unansweredMessages = List.takeWhile userMessagesFun conversations
             unansweredMessages @ (keptPairs |> List.concat) @ [ systemMessage ]
 
-module HttpClientSingleton =
-    let private globalTimeoutMinutes = 2.0
-    
+module HttpClientSingleton =    
     let private createClient() =
         let client = new HttpClient()
         client.Timeout <- TimeSpan.FromMinutes(globalTimeoutMinutes)
