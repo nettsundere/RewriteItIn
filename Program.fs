@@ -142,6 +142,14 @@ let readSourceFiles (sourcePath: string) (allowedFormats: string list option) =
     else
         failwith "Source path does not exist"
 
+let combineMessagesForHistory (systemMessage: ChatMessage) (userMessage: ChatMessage) (history: ChatMessage list) =
+    userMessage :: ( history |> List.filter (fun message -> message.role <> "system") ) @ [ systemMessage ]
+    
+let captureAssistantReplyInHistory (maybeNewMessage: ChatMessage option) (payloadMessages: ChatMessage list) =
+    match maybeNewMessage with
+    | Some value -> value :: payloadMessages
+    | None -> payloadMessages
+
 let createFormatQueryPayload (options: Options) (history: ChatMessage list) =
     let systemMessage = {
         role = "system"
@@ -156,12 +164,11 @@ let createFormatQueryPayload (options: Options) (history: ChatMessage list) =
     let userMessage = {
         role = "user"
         content = $"List all file extensions are used when writing apps using {options.SourceLang} OR {options.TargetLang}, ignore binary files. Also, these are the conversion principles as specified by the User: " + (options.Principles |> Option.defaultValue "None")
-
     }
 
     {
         model = options.Model
-        messages = userMessage :: systemMessage :: history
+        messages = combineMessagesForHistory systemMessage userMessage history 
         temperature = globalTemperature
         max_tokens = maxTokensGlobal
         stream = false
@@ -185,7 +192,7 @@ let createAnalysisPayload (options: Options) (files: CodeFile list) (history: Ch
 
     {
         model = options.Model
-        messages = userMessage :: systemMessage :: history
+        messages = combineMessagesForHistory systemMessage userMessage history 
         temperature = globalTemperature
         max_tokens = maxTokensGlobal
         stream = false
@@ -220,7 +227,7 @@ the source code to write to file write2.cs
 
     {
         model = options.Model
-        messages = userMessage :: systemMessage :: history
+        messages = combineMessagesForHistory systemMessage userMessage history 
         temperature = globalTemperature
         max_tokens = maxTokensGlobal
         stream = false
@@ -235,8 +242,8 @@ let sendRequest (options: Options) (payload: ChatRequest) =
         let jsOptions = JsonSerializerOptions()
         jsOptions.DefaultIgnoreCondition <- JsonIgnoreCondition.WhenWritingNull
         
-        let payload' = { payload with messages = List.rev payload.messages }
-        let json = JsonSerializer.Serialize(payload', jsOptions)
+        let orderedPayload = { payload with messages = List.rev payload.messages }
+        let json = JsonSerializer.Serialize(orderedPayload, jsOptions)
         
         let content = new StringContent(json, Encoding.UTF8, "application/json")
         
@@ -364,17 +371,12 @@ let parseCommandLine (args: string[]) =
     
     parseInternal (args |> Array.toList) defaultOptions
 
-let combineHistory (maybeMessage: ChatMessage option) (history: ChatMessage list) =
-    match maybeMessage with
-    | Some value -> value :: history
-    | None -> history
-
 let queryRelevantFormatsWithHistoryAsync (options: Options) (history: ChatMessage list) = async {
     printfn "\n=== Querying relevant file formats ==="
     let payload = createFormatQueryPayload options history
     let! response = sendRequest options payload
     let message = getMessage response
-    return (parseListResponse message, combineHistory message history)
+    return (parseListResponse message, captureAssistantReplyInHistory message payload.messages)
 }
 
 let printBatch list =
@@ -398,7 +400,7 @@ let filterImportantFilesWithHistoryAsync (options: Options) (allFiles: CodeFile 
         let payload = createAnalysisPayload options batch filteringHistory
         let! response = sendRequest options payload
         let message = getMessage response
-        filteringHistory <- combineHistory message filteringHistory
+        filteringHistory <- captureAssistantReplyInHistory message payload.messages
 
         match parseListResponse message with
         | Some results ->
@@ -423,7 +425,7 @@ let rewriteFilesWithHistoryAsync (options: Options) (files: CodeFile list) (hist
         match parseRewriteResponse message with
         | Some results ->
             printfn $"Successfully converted {results.Length} files"
-            return (Some results, combineHistory message history)
+            return (Some results, captureAssistantReplyInHistory message payload.messages)
         | None ->
             printfn "No valid conversion returned for these files"
             return (None, history)
