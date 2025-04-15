@@ -252,25 +252,24 @@ the source code to write to file write2.cs
         stream = false
     }
     
-let truncateHistoryShuffle (messages: ChatMessage list) (historyLimit: int) = 
+let truncateHistoryShuffle (messages: ChatMessage list) (historyLimit: int) =
     match messages with
     | [] -> []
-    | [single] -> [single]
-    | first :: rest ->
-        let last = List.last rest
-        let middle = rest.[0 .. rest.Length - 2] 
-        
-        let messagesToKeep = min (historyLimit - 2) middle.Length
-        
-        let rng = Random()
-        let keptMiddle = 
-            middle
-            |> shuffle rng
-            |> List.take messagesToKeep
+    | _ ->
+        if historyLimit <= 0 then
+            []
+        else
+            let userMessagesFun = (fun m -> m.role = "user")
+            let systemMessage = List.last messages
+            let conversations = List.take (messages.Length - 1) messages
+            let fromFirstAssistant = List.skipWhile userMessagesFun conversations
+            let pairs = fromFirstAssistant |> List.chunkBySize 2
+            let shuffledPairs = shuffle (Random()) pairs 
+            let maxPairs = (historyLimit - 1) / 2
+            let keptPairs = shuffledPairs |> List.truncate maxPairs
+            let unansweredMessages = List.takeWhile userMessagesFun conversations
+            unansweredMessages @ (keptPairs |> List.concat) @ [ systemMessage ]
             
-        first :: (keptMiddle @ [last])
-    
-
 let sendRequest (options: Options) (payload: ChatRequest) =
     let rec retryWithReducedHistory (currentLimit: int) =
         async {
@@ -281,7 +280,7 @@ let sendRequest (options: Options) (payload: ChatRequest) =
             let jsOptions = JsonSerializerOptions()
             jsOptions.DefaultIgnoreCondition <- JsonIgnoreCondition.WhenWritingNull
             
-            let orderedPayload = { payload with messages = truncateHistoryShuffle (List.rev payload.messages) currentLimit }
+            let orderedPayload = { payload with messages = truncateHistoryShuffle payload.messages currentLimit |> List.rev }
             let json = JsonSerializer.Serialize(orderedPayload, jsOptions)
             
             let content = new StringContent(json, Encoding.UTF8, "application/json")
@@ -331,7 +330,7 @@ let getMessage (rawResponse: string) =
             | (true, message) ->
                 match message.TryGetProperty("content"), message.TryGetProperty("role") with
                 | (true, content), (true, role) ->
-                    Some { content = content.GetString(); role = role.GetString() } // Adjust this to match your ChatMessage type
+                    Some { content = content.GetString(); role = role.GetString() } 
                 | _ -> 
                     printfn "Invalid response: missing content or role"
                     None
@@ -366,7 +365,7 @@ let parseRewriteResponse (message: ChatMessage option) =
             | None ->
                 let trimmedLine = line.TrimStart()
                 if trimmedLine.StartsWith("````") then
-                    let pathPart = trimmedLine.[4..].Trim()  // Remove leading ```` and trim
+                    let pathPart = trimmedLine.[4..].Trim()
                     currentPath <- Some(pathPart)
                     currentContent <- []
             | Some(path) ->
