@@ -2,16 +2,20 @@
 open System.Buffers
 open System.Buffers.Binary
 open System.IO
+open System.Net
 open System.Net.Http
 open System.Numerics
 open System.Text
 open System.Text.Json
 open System.Text.Json.Serialization
+open Microsoft.FSharp.Control
 
 let batchSizeGlobal = 30
 let maxTokensGlobal = 8_192
-let globalTimeoutMinutes = 15;
+let globalTimeoutMinutes = 15
 let globalTemperature = 1.3
+let historyLimitGlobal = 50
+let fileSizeLimitGlobal = 2048
 
 type ChatMessage = {
     role: string
@@ -102,6 +106,15 @@ let isBinaryFile (filePath: string) =
     with
     | _ -> true
 
+let shuffle (rng: Random) (list: 'a list) =
+    let arr = List.toArray list
+    for i in [ 0 .. arr.Length - 1 ] do
+        let j = rng.Next(i, arr.Length)
+        let tmp = arr.[i]
+        arr.[i] <- arr.[j]
+        arr.[j] <- tmp
+    Array.toList arr
+    
 let readSourceFiles (sourcePath: string) (allowedFormats: string list option) =
     let getRelativePath (filePath: string) =
         if Directory.Exists sourcePath then
@@ -118,11 +131,16 @@ let readSourceFiles (sourcePath: string) (allowedFormats: string list option) =
                 ))
         | _ -> files
 
+    let sizeFilter (file: string) =
+        FileInfo(file).Length < fileSizeLimitGlobal
+    
     if Directory.Exists sourcePath then
         Directory.GetFiles(sourcePath, "*", SearchOption.AllDirectories)
         |> Array.toList  
         |> List.filter (isBinaryFile >> not)
         |> filterByFormat
+        |> List.filter sizeFilter
+        |> shuffle (Random())
         |> List.map (fun filePath -> 
             let relativePath = getRelativePath filePath
             let content = File.ReadAllText(filePath)
@@ -232,38 +250,64 @@ the source code to write to file write2.cs
         max_tokens = maxTokensGlobal
         stream = false
     }
-
-let sendRequest (options: Options) (payload: ChatRequest) =
-    async {
-        use client = new HttpClient()
-        client.Timeout <- TimeSpan.FromMinutes(globalTimeoutMinutes)
-        let url = $"{options.ServerUrl}/v1/chat/completions"
-        
-        let jsOptions = JsonSerializerOptions()
-        jsOptions.DefaultIgnoreCondition <- JsonIgnoreCondition.WhenWritingNull
-        
-        let orderedPayload = { payload with messages = List.rev payload.messages }
-        let json = JsonSerializer.Serialize(orderedPayload, jsOptions)
-        
-        let content = new StringContent(json, Encoding.UTF8, "application/json")
-        
-        match options.ApiKey with
-        | Some key -> client.DefaultRequestHeaders.Add("Authorization", $"Bearer {key}")
-        | None -> ()
-        
-        printfn $"Sending request to: {url}"
-
-        let! response = client.PostAsync(url, content) |> Async.AwaitTask
-        
-        if not response.IsSuccessStatusCode then
-            let! errorContent = response.Content.ReadAsStringAsync() |> Async.AwaitTask
-            failwith $"Request failed with status {response.StatusCode}: {errorContent}"
-
-        let! responseContent = response.Content.ReadAsStringAsync() |> Async.AwaitTask
-        printfn $"Received response: {responseContent}"
-        return responseContent
-    }
     
+let truncateHistoryShuffle (messages: ChatMessage list) (historyLimit: int) = 
+    match messages with
+    | [] -> []
+    | [single] -> [single]
+    | first :: rest ->
+        let last = List.last rest
+        let middle = rest.[0 .. rest.Length - 2] 
+        
+        let messagesToKeep = min (historyLimit - 2) middle.Length
+        
+        let rng = Random()
+        let keptMiddle = 
+            middle
+            |> shuffle rng
+            |> List.take messagesToKeep
+            
+        first :: (keptMiddle @ [last])
+    
+
+let sendRequest (options: Options) (payload: ChatRequest) : Async<string> =
+    let rec retryWithReducedHistory (currentLimit: int) : Async<string> =
+        async {
+            use client = new HttpClient()
+            client.Timeout <- TimeSpan.FromMinutes(globalTimeoutMinutes)
+            let url = $"{options.ServerUrl}/v1/chat/completions"
+            
+            let jsOptions = JsonSerializerOptions()
+            jsOptions.DefaultIgnoreCondition <- JsonIgnoreCondition.WhenWritingNull
+            
+            let orderedPayload = { payload with messages = truncateHistoryShuffle (List.rev payload.messages) currentLimit }
+            let json = JsonSerializer.Serialize(orderedPayload, jsOptions)
+            
+            let content = new StringContent(json, Encoding.UTF8, "application/json")
+            
+            match options.ApiKey with
+            | Some key -> client.DefaultRequestHeaders.Add("Authorization", $"Bearer {key}")
+            | None -> ()
+            
+            printfn $"Sending request to: {url} with history limit: {currentLimit}"
+
+            let! response = client.PostAsync(url, content) |> Async.AwaitTask
+            
+            if response.StatusCode = HttpStatusCode.BadRequest && currentLimit >= 2 then
+                let newLimit = currentLimit / 2
+                printfn $"Bad request received, reducing history limit from {currentLimit} to {newLimit}"
+                return! retryWithReducedHistory newLimit
+            elif not response.IsSuccessStatusCode then
+                let! errorContent = response.Content.ReadAsStringAsync() |> Async.AwaitTask
+                return failwith $"Request failed with status {response.StatusCode}: {errorContent}"
+            else
+                let! responseContent = response.Content.ReadAsStringAsync() |> Async.AwaitTask
+                printfn $"Received response: {responseContent}"
+                return responseContent
+        }
+    
+    retryWithReducedHistory historyLimitGlobal
+
 let getMessage (rawResponse: string) =
     try
         use jsonDoc = JsonDocument.Parse(rawResponse)
