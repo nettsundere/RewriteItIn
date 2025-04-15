@@ -293,12 +293,20 @@ let truncateHistoryShuffle (messages: ChatMessage list) (historyLimit: int) =
             let keptPairs = shuffledPairs |> List.truncate maxPairs
             let unansweredMessages = List.takeWhile userMessagesFun conversations
             unansweredMessages @ (keptPairs |> List.concat) @ [ systemMessage ]
-            
+
+module HttpClientSingleton =
+    let private globalTimeoutMinutes = 2.0
+    
+    let private createClient() =
+        let client = new HttpClient()
+        client.Timeout <- TimeSpan.FromMinutes(globalTimeoutMinutes)
+        client
+    
+    let Instance = lazy(createClient())
+
 let sendRequest (options: Options) (payload: ChatRequest) =
     let rec retryWithReducedHistory (currentLimit: int) =
-        async {
-            use client = new HttpClient()
-            client.Timeout <- TimeSpan.FromMinutes(globalTimeoutMinutes)
+        async { 
             let url = $"{options.ServerUrl}/v1/chat/completions"
             
             let jsOptions = JsonSerializerOptions()
@@ -307,16 +315,22 @@ let sendRequest (options: Options) (payload: ChatRequest) =
             let orderedPayload = { payload with messages = truncateHistoryShuffle payload.messages currentLimit |> List.rev }
             let json = JsonSerializer.Serialize(orderedPayload, jsOptions)
             
-            let content = new StringContent(json, Encoding.UTF8, "application/json")
+            use content = new StringContent(json, Encoding.UTF8, "application/json")
+            use request = new HttpRequestMessage(HttpMethod.Post, url)
+            request.Content <- content
             
+            // Add authorization header per request
             match options.ApiKey with
-            | Some key -> client.DefaultRequestHeaders.Add("Authorization", $"Bearer {key}")
+            | Some key -> 
+                request.Headers.Authorization <- 
+                    Headers.AuthenticationHeaderValue("Bearer", key)
             | None -> ()
             
             printfn $"Sending request to: {url} with history limit: {currentLimit}"
 
             try
-                let! response = client.PostAsync(url, content) |> Async.AwaitTask
+                let client = HttpClientSingleton.Instance.Value
+                let! response = client.SendAsync(request) |> Async.AwaitTask
                 
                 if response.StatusCode = HttpStatusCode.BadRequest && currentLimit >= 2 then
                     let newLimit = currentLimit / 2
@@ -333,7 +347,7 @@ let sendRequest (options: Options) (payload: ChatRequest) =
             with
             | ex when currentLimit >= 2 ->
                 let newLimit = currentLimit / 2
-                printfn $"Request failed {ex.Message}, {ex.StackTrace}, reducing history limit from {currentLimit} to {newLimit}"
+                printfn $"Request failed {ex.Message}, reducing history limit from {currentLimit} to {newLimit}"
                 return! retryWithReducedHistory newLimit
             | ex ->
                 return raise ex
