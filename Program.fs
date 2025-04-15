@@ -15,7 +15,7 @@ let maxTokensGlobal = 8_192
 let globalTimeoutMinutes = 15
 let globalTemperature = 1.3
 let historyLimitGlobal = 25
-let fileSizeLimitGlobal = 2048
+let fileSizeLimitGlobal = 1024 * 50_000
 let conversionRetriesGlobal = 3
 
 type ChatMessage = {
@@ -117,49 +117,73 @@ let shuffle (rng: Random) (list: 'a list) =
     Array.toList arr
     
 let readSourceFiles (sourcePath: string) (allowedFormats: string list option) =
+    let ensureTrailingSlash (path: string) =
+        if not (path.EndsWith(Path.DirectorySeparatorChar)) then path + string Path.DirectorySeparatorChar
+        else path
+
+    let sourceUri = 
+        Path.GetFullPath(sourcePath)
+        |> ensureTrailingSlash
+        |> fun p -> Uri(p, UriKind.Absolute)
+
+    let toUri (path: string) =
+        Path.GetFullPath(path)
+        |> fun p -> Uri(p, UriKind.Absolute)
+
     let getRelativePath (filePath: string) =
-        if Directory.Exists sourcePath then
-            Path.GetRelativePath(sourcePath, filePath)
-        else
-            Path.GetFileName(filePath)
+        let fileUri = toUri filePath
+        if not (sourceUri.IsBaseOf(fileUri)) then
+            failwithf $"Attempted to access file outside source directory: %s{filePath}"
+        sourceUri.MakeRelativeUri(fileUri).ToString().Replace('/', Path.DirectorySeparatorChar)
 
-    let filterByFormat (files: string list) =
+    let hasAllowedExtension (filePath: string) (formats: string list) =
+        let fileExt = Path.GetExtension(filePath).ToLowerInvariant()
+        formats |> List.exists (fun ext -> 
+            let normalizedExt = ext.ToLowerInvariant()
+            fileExt = normalizedExt)
+
+    let extensionAllowed (filePath: string) =
         match allowedFormats with
-        | Some formats ->
-            files |> List.filter (fun f ->
-                formats |> List.exists (fun ext ->
-                    f.EndsWith(ext, StringComparison.OrdinalIgnoreCase)
-                ))
-        | _ -> files
+        | Some formats -> hasAllowedExtension filePath formats
+        | None -> true
 
-    let sizeFilter (file: string) =
-        FileInfo(file).Length < fileSizeLimitGlobal
+    let readFileContent filePath =
+        { 
+            path = if Directory.Exists sourcePath 
+                   then getRelativePath filePath 
+                   else Path.GetFileName(filePath)
+            content = File.ReadAllText(filePath) 
+        }
+
+    let isNotTooBig file = FileInfo(file).Length < fileSizeLimitGlobal
     
-    if Directory.Exists sourcePath then
-        Directory.GetFiles(sourcePath, "*", SearchOption.AllDirectories)
-        |> Array.toList  
-        |> List.filter (isBinaryFile >> not)
-        |> filterByFormat
-        |> List.filter sizeFilter
-        |> shuffle (Random())
-        |> List.map (fun filePath -> 
-            let relativePath = getRelativePath filePath
-            let content = File.ReadAllText(filePath)
-            { path = relativePath; content = content })
-    elif File.Exists sourcePath then
-        if isBinaryFile sourcePath then
+    let processDirectory () =
+        try
+            Directory.GetFiles(sourceUri.LocalPath, "*", SearchOption.AllDirectories)
+            |> Array.filter (isBinaryFile >> not)
+            |> Array.filter extensionAllowed
+            |> Array.filter isNotTooBig
+            |> Array.map readFileContent
+            |> Array.toList
+        with
+        | :? UnauthorizedAccessException -> []
+        | :? DirectoryNotFoundException -> []
+
+    let processSingleFile () =
+        let fileUri = toUri sourcePath
+        if not (sourceUri.IsBaseOf(fileUri)) then
             []
-        else
-            let shouldInclude = 
-                match allowedFormats with
-                | Some formats -> formats |> List.exists (fun ext -> sourcePath.EndsWith(ext, StringComparison.OrdinalIgnoreCase))
-                | None -> true
-            if shouldInclude then
-                [ { path = getRelativePath sourcePath; content = File.ReadAllText(sourcePath) } ]
-            else
-                []
+        elif isBinaryFile sourcePath || not (extensionAllowed sourcePath) then 
+            []
+        else 
+            [readFileContent sourcePath]
+
+    if Directory.Exists sourceUri.LocalPath then
+        processDirectory ()
+    elif File.Exists sourceUri.LocalPath then
+        processSingleFile ()
     else
-        failwith "Source path does not exist"
+        []
 
 let combineMessagesForHistory (systemMessage: ChatMessage) (userMessage: ChatMessage) (history: ChatMessage list) =
     userMessage :: ( history |> List.filter (fun message -> message.role <> "system") ) @ [ systemMessage ]
