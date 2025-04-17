@@ -1,4 +1,6 @@
-﻿open System
+﻿module Main
+
+open System
 open System.Buffers
 open System.IO
 open System.Net
@@ -101,7 +103,7 @@ let shuffle (rng: Random) (list: 'a list) =
         arr.[j] <- tmp
     Array.toList arr
     
-let readSourceFiles (options: Options) (allowedFormats: string list option) =
+let readSourceFiles (options: Options) (allowedFormats: string Set option) =
     let ensureTrailingSlash (path: string) =
         if not (path.EndsWith(Path.DirectorySeparatorChar)) then path + string Path.DirectorySeparatorChar
         else path
@@ -121,9 +123,9 @@ let readSourceFiles (options: Options) (allowedFormats: string list option) =
             failwithf $"Attempted to access file outside source directory: %s{filePath}"
         sourceUri.MakeRelativeUri(fileUri).ToString().Replace('/', Path.DirectorySeparatorChar)
 
-    let hasAllowedExtension (filePath: string) (formats: string list) =
+    let hasAllowedExtension (filePath: string) (formats: string Set) =
         let fileExt = Path.GetExtension(filePath).ToLowerInvariant()
-        formats |> List.exists (fun ext -> 
+        formats |> Set.exists (fun ext -> 
             let normalizedExt = ext.ToLowerInvariant()
             fileExt = normalizedExt)
 
@@ -144,12 +146,23 @@ let readSourceFiles (options: Options) (allowedFormats: string list option) =
     
     let processDirectory () =
         try
-            Directory.GetFiles(sourceUri.LocalPath, "*", SearchOption.AllDirectories)
-            |> Array.filter (isBinaryFile >> not)
-            |> Array.filter extensionAllowed
-            |> Array.filter isNotTooBig
-            |> Array.map readFileContent
-            |> Array.toList
+            let allowed =
+                Directory.GetFiles(sourceUri.LocalPath, "*", SearchOption.AllDirectories)
+                |> Array.filter (isBinaryFile >> not)
+                |> Array.filter extensionAllowed
+            
+            let (sizeOk, sizeNotOk) =
+                allowed
+                |> Array.partition isNotTooBig
+            
+            if not (Array.isEmpty sizeNotOk) then
+                printfn $"Following files are too big to process according to the current file size limit (%d{options.FileSizeLimitBytes} bytes):"
+                sizeNotOk
+                |> Array.iter (fun file -> printfn $"- %s{file}")
+
+            sizeOk
+                |> Array.map readFileContent
+                |> Array.toList
         with
         | :? UnauthorizedAccessException -> []
         | :? DirectoryNotFoundException -> []
@@ -205,13 +218,16 @@ let createFormatQueryPayload (options: Options) (history: ChatMessage list) =
 let createAnalysisPayload (options: Options) (files: CodeFile list) (history: ChatMessage list) =
     let systemMessage = {
         role = "system"
-        content = "Analyze these code files and identify which ones are important when rewriting it to another language.
+        content = "Analyze these code files by filenames and identify which ones are important when rewriting it to another language.
         You have to Respond with a newline (\\n) separated list of such filenames. Provide no other data, just filenames.
-        Add a newline to the end of a list. Input is JSON, { files = [ { filename, source }, ... ] }"
+        Add a newline to the end of a list. Input is JSON, { files = [ filename1, filename2, ...] }"
     }
 
+    let justFilenames =
+        List.map (_.path) files
+    
     let userContent = 
-        JsonSerializer.Serialize({| files = files |}, JsonSerializerOptions(WriteIndented = true))
+        JsonSerializer.Serialize({| files = justFilenames |}, JsonSerializerOptions(WriteIndented = true))
 
     let userMessage = {
         role = "user"
@@ -365,13 +381,13 @@ let getMessage (rawResponse: string) =
         printfn $"Error parsing response: {ex.Message}"
         None
         
-let parseListResponse (message: ChatMessage option) =
+let parseSetResponse (message: ChatMessage option) =
     message   
     |> Option.map (fun message ->
         message.content.Split([|'\n'; '\r'|], StringSplitOptions.RemoveEmptyEntries)
         |> Array.map (fun s -> s.Trim())
         |> Array.filter (System.String.IsNullOrWhiteSpace >> not)
-        |> Array.toList
+        |> Set.ofArray
     )
     
 let parseRewriteResponse (message: ChatMessage option) =
@@ -464,7 +480,7 @@ let queryRelevantFormatsWithHistoryAsync (options: Options) (history: ChatMessag
     let payload = createFormatQueryPayload options history
     let! response = sendRequest options payload
     let message = getMessage response
-    return (parseListResponse message, captureAssistantReplyInHistory message payload.messages)
+    return (parseSetResponse message, captureAssistantReplyInHistory message payload.messages)
 }
 
 let printBatch list =
@@ -473,36 +489,36 @@ let printBatch list =
     |> List.iter (fun file -> printfn $"  - {file.path}")
 
 let filterImportantFilesWithHistoryAsync (options: Options) (allFiles: CodeFile list) (history: ChatMessage List) = async {
-    printfn "\n=== Filtering important files ==="
-    let batchSize = options.BatchSize
-    let batches = 
-        allFiles 
-        |> List.chunkBySize batchSize
-
-    let mutable importantFiles = Set.empty
-    let mutable filteringHistory = history
-    
-    for batch in batches do
-        printfn $"Analyzing batch of {batch.Length} files..."
-        printBatch batch
-        let payload = createAnalysisPayload options batch filteringHistory
-        let! response = sendRequest options payload
-        let message = getMessage response
-        filteringHistory <- captureAssistantReplyInHistory message payload.messages
-
-        match parseListResponse message with
-        | Some results ->
-            importantFiles <- Set.union importantFiles (results |> Set.ofList)
-            printfn $"Found {results.Length} important files in this batch (Total: {importantFiles.Count})"
-        | None -> 
-            printfn "No important files identified in this batch"
-        
-    let files =
-        allFiles
-        |> List.filter (fun file -> Set.contains file.path importantFiles)
-        
-    return (files, filteringHistory)
-}
+     printfn $"\n=== Filtering important files ({allFiles.Length}) ==="
+     let batchSize = options.BatchSize * 150
+     let batches = 
+         allFiles 
+         |> List.chunkBySize batchSize
+ 
+     let mutable importantFiles = Set.empty
+     let mutable filteringHistory = history
+ 
+     for batch in batches do
+         printfn $"Analyzing batch of {batch.Length} files..."
+         printBatch batch
+         let payload = createAnalysisPayload options batch filteringHistory
+         let! response = sendRequest options payload
+         let message = getMessage response
+         filteringHistory <- captureAssistantReplyInHistory message payload.messages
+ 
+         match parseSetResponse message with
+         | Some results ->
+             importantFiles <- Set.union importantFiles results
+             printfn $"Found {results.Count} important files in this batch (Total: {importantFiles.Count})"
+         | None -> 
+             printfn "No important files identified in this batch"
+ 
+     let files =
+         allFiles
+         |> List.filter (fun file -> Set.contains file.path importantFiles)
+ 
+     return (files, filteringHistory)
+ }
 
 let rewriteFilesWithHistoryAsync (options: Options) (files: CodeFile list) (history: ChatMessage list)  = async {
     printfn $"\nProcessing {files.Length} files..."
@@ -524,20 +540,36 @@ let rewriteFilesWithHistoryAsync (options: Options) (files: CodeFile list) (hist
 
 
 let rewriteBatchWithRetryAsync (options: Options) (batch: CodeFile list) (history: ChatMessage list) (maxRetries: int) = async {
-    let rec retry attemptsRemaining = async {
+    let rec retry attemptsRemaining currentBatch currentHistory = async {
         try
-            let! (results, newHistory) = rewriteFilesWithHistoryAsync options batch history
+            let! (results, newHistory) = rewriteFilesWithHistoryAsync options currentBatch currentHistory
             return (results, newHistory)
-        with ex ->
+        with 
+        | :? HttpRequestException as ex when ex.Message.Contains("400") && currentBatch.Length > 1 ->
+            printfn "Bad request received, splitting batch in half..."
+            let half = currentBatch.Length / 2
+            let batch1 = currentBatch.[0..half-1]
+            let batch2 = currentBatch.[half..]
+            
+            let! (results1, historyOne) = retry maxRetries batch1 currentHistory
+            match results1 with
+            | Some r1 ->
+                let! (results2, historyTwo) = retry maxRetries batch2 historyOne
+                match results2 with
+                | Some r2 -> return (Some (r1 @ r2), historyTwo)
+                | None -> return (None, historyTwo)
+            | None -> return (None, historyOne)
+            
+        | ex ->
             if attemptsRemaining > 0 then
                 printfn $"Retrying batch ({maxRetries - attemptsRemaining + 1}/{maxRetries})..."
-                return! retry (attemptsRemaining - 1)
+                return! retry (attemptsRemaining - 1) currentBatch currentHistory
             else
                 printfn $"Failed to rewrite batch after {maxRetries} attempts: {ex.Message}"
-                return (None, history)
+                return (None, currentHistory)
     }
     
-    return! retry maxRetries
+    return! retry maxRetries batch history
 }
 
 let rewriteFilesInBatchesWithRetryAsync (options: Options) (files: CodeFile list) (initialHistory: ChatMessage list) (maxRetries: int) = async {
@@ -571,7 +603,7 @@ let runConversion (options: Options) (history: ChatMessage List) = async {
         printfn $"Reading source files from %s{options.SourcePath}"
         let allSourceFiles = readSourceFiles options relevantFormatsList
         printfn $"Found {allSourceFiles.Length} relevant files to process"
-
+        
         let! (importantFiles, importantFilesHistory) = filterImportantFilesWithHistoryAsync options allSourceFiles formatsHistory
         printfn $"Identified {importantFiles.Length} important files to convert"
 
@@ -581,16 +613,16 @@ let runConversion (options: Options) (history: ChatMessage List) = async {
         let! successCount, _ = rewriteFilesInBatchesWithRetryAsync options importantFiles importantFilesHistory options.ConversionRetries
         
         printfn $"\nConversion complete. Successfully converted {successCount} of {importantFiles.Length} important files"
-        return 0
+        return history
     with
     | :? OperationCanceledException as ex ->
         Console.ForegroundColor <- ConsoleColor.Red
         printfn $"\nTask cancelled: {ex.Message}"
         Console.ResetColor()
-        return 1
+        return history
     | ex ->
         printfn $"\nError: %s{ex.Message}"
-        return 1
+        return history
 }
 
 [<EntryPoint>]
@@ -599,21 +631,21 @@ let main argv =
         if argv.Length = 0 then
             printfn "Usage: dotnet run [options]"
             printfn "Options:"
-            printfn "  --source <path>          Source file/directory"
-            printfn "  --source-lang <lang>     Source language"
-            printfn "  --target <path>          Target directory"
-            printfn "  --target-lang <lang>     Target language"
-            printfn "  --server <url>           API server URL"
-            printfn "  --model <model>          LLM Model name"
-            printfn "  --batch-size <n>         (Optional) Files per batch (default: 30)"
-            printfn "  --max-tokens <n>         (Optional) Max response tokens (default: 8192)"
-            printfn "  --temperature <f>        (Optional) LLM temperature (default: 1.3)"
-            printfn "  --history-limit <n>      (Optional) Conversation history limit (default: 25)"
-            printfn "  --file-size-limit <n>    (Optional) Max file size in bytes (default: 130_000)"
-            printfn "  --conversion-retries <n> (Optional) Conversion retries (default: 3)"
-            printfn "  --timeout-minutes <n>    (Optional) LLM API Timeout in minutes (default: 25)"
-            printfn "  --principles <text>      (Optional) Conversion principles"
-            printfn "  --api-key <key>          (Optional) API key"
+            printfn "  --source <path>                Source file/directory"
+            printfn "  --source-lang <lang>           Source language"
+            printfn "  --target <path>                Target directory"
+            printfn "  --target-lang <lang>           Target language"
+            printfn "  --server <url>                 API server URL"
+            printfn "  --model <model>                LLM Model name"
+            printfn "  --batch-size <n>               (Optional) Files per batch (default: 30)"
+            printfn "  --max-tokens <n>               (Optional) Max response tokens (default: 8192)"
+            printfn "  --temperature <f>              (Optional) LLM temperature (default: 1.3)"
+            printfn "  --history-limit <n>            (Optional) Conversation history limit (default: 25)"
+            printfn "  --file-size-limit-bytes <n>    (Optional) Max file size in bytes (default: 120_000)"
+            printfn "  --conversion-retries <n>       (Optional) Conversion retries (default: 3)"
+            printfn "  --timeout-minutes <n>          (Optional) LLM API Timeout in minutes (default: 25)"
+            printfn "  --principles <text>            (Optional) Conversion principles"
+            printfn "  --api-key <key>                (Optional) API key"
             1
         else
             let options = parseCommandLine argv
@@ -625,7 +657,14 @@ let main argv =
             if String.IsNullOrEmpty(options.ServerUrl) then failwith "Server URL is required"
             if String.IsNullOrEmpty(options.Model) then failwith "LLM Model is required"
 
-            runConversion options [] |> Async.RunSynchronously
+            let history = runConversion options [] |> Async.RunSynchronously
+            runConversion { options
+                            with
+                                SourcePath = options.TargetPath
+                                SourceLang = options.TargetLang
+                                Principles = Some "Finish implementation" 
+                           } history |> Async.RunSynchronously |> ignore
+            0
     with
     | ex ->
         printfn $"Error: {ex.Message}"
