@@ -219,14 +219,10 @@ let createFormatQueryPayload (options: Options) (history: ChatMessage list) =
 let createAnalysisPayload (options: Options) (files: CodeFile list) (history: ChatMessage list) =
     let principlesText =
             match options.Principles with
-                | Some principles -> $"Use following principles: {principles} when picking up the files to rewrite"
+                | Some principles -> $"using following principles: {principles} when picking up the files to rewrite"
                 | None -> ""
                 
-    let systemMessageContent =
-        "Analyze these code files by filenames and identify which ones are important when rewriting it to another language." +
-        principlesText +
-        "You have to Respond with a newline (\\n) separated list of such filenames. Provide no other data, just filenames.
-        Add a newline to the end of a list. Input is JSON, { files = [ filename1, filename2, ...] }"
+    let systemMessageContent = $"Just acknowledge these files and paths as files we are going to rewrite from {options.SourceLang} to {options.TargetLang} ${principlesText}, respond with OK and nothing else"
     let systemMessage = {
         role = "system"
         content = systemMessageContent
@@ -473,7 +469,7 @@ let parseCommandLine (args: string[]) =
         ServerUrl = ""
         Model = ""
         BatchSize = 30
-        AnalysisBatchSize = 80 
+        AnalysisBatchSize = 100
         MaxTokens = 8192
         Temperature = 1.3
         HistoryLimit = 25
@@ -499,36 +495,24 @@ let printBatch list =
     list 
     |> List.iter (fun file -> printfn $"  - {file.path}")
 
-let filterImportantFilesWithHistoryAsync (options: Options) (allFiles: CodeFile list) (history: ChatMessage List) = async {
+let AnalyzeFilesWithHistoryAsync (options: Options) (allFiles: CodeFile list) (history: ChatMessage List) = async {
      printfn $"\n=== Filtering important files ({allFiles.Length}) ==="
      let batchSize = options.AnalysisBatchSize
      let batches = 
          allFiles 
          |> List.chunkBySize batchSize
  
-     let mutable importantFiles = Set.empty
-     let mutable filteringHistory = history
+     let mutable analysisHistory = history
  
      for batch in batches do
          printfn $"Analyzing batch of {batch.Length} files..."
          printBatch batch
-         let payload = createAnalysisPayload options batch filteringHistory
+         let payload = createAnalysisPayload options batch analysisHistory
          let! response = sendRequest options payload
          let message = getMessage response
-         filteringHistory <- captureAssistantReplyInHistory message payload.messages
+         analysisHistory <- captureAssistantReplyInHistory message payload.messages
  
-         match parseSetResponse message with
-         | Some results ->
-             importantFiles <- Set.union importantFiles results
-             printfn $"Found {results.Count} important files in this batch (Total: {importantFiles.Count})"
-         | None -> 
-             printfn "No important files identified in this batch"
- 
-     let files =
-         allFiles
-         |> List.filter (fun file -> Set.contains file.path importantFiles)
- 
-     return (files, filteringHistory)
+     return (allFiles, analysisHistory)
  }
 
 let rewriteFilesWithHistoryAsync (options: Options) (files: CodeFile list) (history: ChatMessage list)  = async {
@@ -615,8 +599,8 @@ let runConversion (options: Options) (history: ChatMessage List) = async {
         let allSourceFiles = readSourceFiles options relevantFormatsList
         printfn $"Found {allSourceFiles.Length} relevant files to process"
         
-        let! (importantFiles, importantFilesHistory) = filterImportantFilesWithHistoryAsync options allSourceFiles formatsHistory
-        printfn $"Identified {importantFiles.Length} important files to convert"
+        let! (importantFiles, importantFilesHistory) = AnalyzeFilesWithHistoryAsync options allSourceFiles formatsHistory
+        printfn $"Analyzed {importantFiles.Length} relevant files to convert"
 
         Directory.CreateDirectory(options.TargetPath) |> ignore
         
@@ -649,7 +633,7 @@ let main argv =
             printfn "  --server <url>                 API server URL"
             printfn "  --model <model>                LLM Model name"
             printfn "  --batch-size <n>               (Optional) Files per batch (default: 30)"
-            printfn "  --analysis-batch-size <n>      (Optional) Analysis batch size (default: 80)"
+            printfn "  --analysis-batch-size <n>      (Optional) Analysis batch size (default: 100)"
             printfn "  --max-tokens <n>               (Optional) Max response tokens (default: 8192)"
             printfn "  --temperature <f>              (Optional) LLM temperature (default: 1.3)"
             printfn "  --history-limit <n>            (Optional) Conversation history limit (default: 25)"
