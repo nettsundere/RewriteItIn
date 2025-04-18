@@ -28,6 +28,7 @@ Options:
   --server <url>                 API server URL
   --model <model>                LLM Model name
   --batch-size <n>               (Optional) Files per batch (default: 30)
+  --analysis-batch-size <n>      (Optional) Analysis batch size (default: 80)
   --max-tokens <n>               (Optional) Max response tokens (default: 8192)
   --temperature <f>              (Optional) LLM temperature (default: 1.3)
   --history-limit <n>            (Optional) Conversation history limit (default: 25)

@@ -38,6 +38,7 @@ type Options = {
     ServerUrl: string
     Model: string
     BatchSize: int
+    AnalysisBatchSize: int
     MaxTokens: int
     Temperature: float
     HistoryLimit: int
@@ -453,6 +454,7 @@ let parseCommandLine (args: string[]) =
         | "--server" :: url :: rest -> parseInternal rest { options with ServerUrl = url }
         | "--model" :: model :: rest -> parseInternal rest { options with Model = model }
         | "--batch-size" :: size :: rest -> parseInternal rest { options with BatchSize = int size }
+        | "--analysis-batch-size" :: size :: rest -> parseInternal rest { options with AnalysisBatchSize = int size }
         | "--max-tokens" :: tokens :: rest -> parseInternal rest { options with MaxTokens = int tokens }
         | "--temperature" :: temp :: rest -> parseInternal rest { options with Temperature = float temp }
         | "--history-limit" :: limit :: rest -> parseInternal rest { options with HistoryLimit = int limit }
@@ -471,6 +473,7 @@ let parseCommandLine (args: string[]) =
         ServerUrl = ""
         Model = ""
         BatchSize = 30
+        AnalysisBatchSize = 80 
         MaxTokens = 8192
         Temperature = 1.3
         HistoryLimit = 25
@@ -498,7 +501,7 @@ let printBatch list =
 
 let filterImportantFilesWithHistoryAsync (options: Options) (allFiles: CodeFile list) (history: ChatMessage List) = async {
      printfn $"\n=== Filtering important files ({allFiles.Length}) ==="
-     let batchSize = options.BatchSize * 150
+     let batchSize = options.AnalysisBatchSize
      let batches = 
          allFiles 
          |> List.chunkBySize batchSize
@@ -646,6 +649,7 @@ let main argv =
             printfn "  --server <url>                 API server URL"
             printfn "  --model <model>                LLM Model name"
             printfn "  --batch-size <n>               (Optional) Files per batch (default: 30)"
+            printfn "  --analysis-batch-size <n>      (Optional) Analysis batch size (default: 80)"
             printfn "  --max-tokens <n>               (Optional) Max response tokens (default: 8192)"
             printfn "  --temperature <f>              (Optional) LLM temperature (default: 1.3)"
             printfn "  --history-limit <n>            (Optional) Conversation history limit (default: 25)"
