@@ -216,11 +216,19 @@ let createFormatQueryPayload (options: Options) (history: ChatMessage list) =
     }
 
 let createAnalysisPayload (options: Options) (files: CodeFile list) (history: ChatMessage list) =
+    let principlesText =
+            match options.Principles with
+                | Some principles -> $"Use following principles: {principles} when picking up the files to rewrite"
+                | None -> ""
+                
+    let systemMessageContent =
+        "Analyze these code files by filenames and identify which ones are important when rewriting it to another language." +
+        principlesText +
+        "You have to Respond with a newline (\\n) separated list of such filenames. Provide no other data, just filenames.
+        Add a newline to the end of a list. Input is JSON, { files = [ filename1, filename2, ...] }"
     let systemMessage = {
         role = "system"
-        content = "Analyze these code files by filenames and identify which ones are important when rewriting it to another language.
-        You have to Respond with a newline (\\n) separated list of such filenames. Provide no other data, just filenames.
-        Add a newline to the end of a list. Input is JSON, { files = [ filename1, filename2, ...] }"
+        content = systemMessageContent
     }
 
     let justFilenames =
