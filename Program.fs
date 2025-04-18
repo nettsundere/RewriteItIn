@@ -495,7 +495,7 @@ let printBatch list =
     list 
     |> List.iter (fun file -> printfn $"  - {file.path}")
 
-let AnalyzeFilesWithHistoryAsync (options: Options) (allFiles: CodeFile list) (history: ChatMessage List) = async {
+let analyzeFilesWithHistoryAsync (options: Options) (allFiles: CodeFile list) (history: ChatMessage List) = async {
      printfn $"\n=== Filtering important files ({allFiles.Length}) ==="
      let batchSize = options.AnalysisBatchSize
      let batches = 
@@ -599,7 +599,7 @@ let runConversion (options: Options) (history: ChatMessage List) = async {
         let allSourceFiles = readSourceFiles options relevantFormatsList
         printfn $"Found {allSourceFiles.Length} relevant files to process"
         
-        let! (importantFiles, importantFilesHistory) = AnalyzeFilesWithHistoryAsync options allSourceFiles formatsHistory
+        let! (importantFiles, importantFilesHistory) = analyzeFilesWithHistoryAsync options allSourceFiles formatsHistory
         printfn $"Analyzed {importantFiles.Length} relevant files to convert"
 
         Directory.CreateDirectory(options.TargetPath) |> ignore
