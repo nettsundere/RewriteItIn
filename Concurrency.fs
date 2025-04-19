@@ -2,8 +2,6 @@ module RewriteItIn.Concurrency
 
 open System
 open System.Collections.Concurrent
-
-open System.Collections.Concurrent
 open System.Threading
 
 let runThrottled (maxConcurrency: int) (tasks: seq<Async<'T>>) : Async<'T list> = 
@@ -30,7 +28,7 @@ let runThrottled (maxConcurrency: int) (tasks: seq<Async<'T>>) : Async<'T list> 
             |> Async.Parallel
 
         if exceptions.Count > 0 then
-            return raise (AggregateException(exceptions) :> exn)
+            return raise (AggregateException(exceptions))
         
         return results.ToArray() |> Array.toList
     }
