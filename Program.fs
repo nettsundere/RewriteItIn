@@ -215,7 +215,7 @@ let createFormatQueryPayload (options: Options) =
 
     let userMessage = {
         role = "user"
-        content = $"List all file extensions are used when writing apps using {options.SourceLang} OR {options.TargetLang}, ignore binary files. Also, these are the conversion principles as specified by the User: " + (options.Principles |> Option.defaultValue "None")
+        content = $"List all file extensions are used when writing apps using {options.SourceLang} OR {options.TargetLang}, ignore binary files. Also, these are the conversion principles as specified by the User, use them to figure out more formats: " + (options.Principles |> Option.defaultValue "None")
     }
 
     {
