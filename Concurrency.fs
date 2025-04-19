@@ -1,32 +1,36 @@
 module RewriteItIn.Concurrency
 
 open System
+open System.Collections.Concurrent
 
-    let runThrottled (maxConcurrency: int) (tasks: seq<Async<'T>>) () = 
-        async {
-            use semaphore = new Threading.SemaphoreSlim(maxConcurrency)
-            let results = ResizeArray<'T>()
-            let exceptions = ResizeArray<exn>()
+open System.Collections.Concurrent
+open System.Threading
 
-            let processTask task = async {
-                try 
-                    do! semaphore.WaitAsync() |> Async.AwaitTask
-                    try
-                        let! result = task
-                        lock results (fun () -> results.Add(result))
-                    finally
-                        semaphore.Release() |> ignore
-                with ex ->
-                    lock exceptions (fun () -> exceptions.Add(ex))
-            }
+let runThrottled (maxConcurrency: int) (tasks: seq<Async<'T>>) : Async<'T list> = 
+    async {
+        use semaphore = new SemaphoreSlim(maxConcurrency)
+        let results = ConcurrentBag<'T>()
+        let exceptions = ConcurrentBag<exn>()
 
-            let! completed = 
-                tasks
-                |> Seq.map processTask
-                |> Async.Parallel
-
-            if exceptions.Count > 0 then
-                return raise (AggregateException(exceptions))
-            
-            return results
+        let processTask (task: Async<'T>) = async {
+            try
+                do! semaphore.WaitAsync() |> Async.AwaitTask
+                try
+                    let! result = task
+                    results.Add(result)
+                finally
+                    semaphore.Release() |> ignore
+            with ex ->
+                exceptions.Add(ex)
         }
+
+        let! _ =
+            tasks
+            |> Seq.map processTask
+            |> Async.Parallel
+
+        if exceptions.Count > 0 then
+            return raise (AggregateException(exceptions) :> exn)
+        
+        return results.ToArray() |> Array.toList
+    }
