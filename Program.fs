@@ -410,6 +410,7 @@ let printBatch list =
     list 
     |> List.iter (fun file -> printfn $"  - {file.path}")
 
+exception NoValidConversionException
 let rewriteBatchAsync (options: Options) (files: CodeFile list)  = async {
     printfn $"\nProcessing {files.Length} files..."
 
@@ -422,7 +423,7 @@ let rewriteBatchAsync (options: Options) (files: CodeFile list)  = async {
         return results
     | None ->
         printfn "No valid conversion returned for these files"
-        return []      
+        return! raise NoValidConversionException      
 }
 
 let private fileWriteLock = obj()
@@ -463,8 +464,8 @@ let rec rewriteFilesInBatchesAsync (options: Options) (files: CodeFile list) = a
                             results |> List.iter (writeOutputFile options.TargetPath)
                             return results.Length
                         with
-                        | :? BatchTooBigException as ex when currentOptions.BatchSize > 1 ->
-                            printfn $"Error processing batch: {ex.Message}. Retrying with smaller batch size."
+                        | :? BatchTooBigException | NoValidConversionException as ex when currentOptions.BatchSize > 1 ->
+                            printfn $"Error processing batch: {ex}. Retrying with smaller batch size."
                             let newBatchSize = currentOptions.BatchSize / 2
                             let smallerBatches = currentBatch |> List.chunkBySize newBatchSize
                             let! counts = 
