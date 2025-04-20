@@ -10,6 +10,7 @@ open System.Text
 open System.Text.Json
 open System.Text.Json.Serialization
 open System.Threading
+open System.Threading.Tasks
 open Microsoft.FSharp.Control
 open RewriteItIn.Concurrency
 
@@ -112,15 +113,6 @@ let isBinaryFile (filePath: string) =
             isBinary
     with
     | _ -> true
-
-let shuffle (rng: Random) (list: 'a list) =
-    let arr = List.toArray list
-    for i in [ 0 .. arr.Length - 1 ] do
-        let j = rng.Next(i, arr.Length)
-        let tmp = arr.[i]
-        arr.[i] <- arr.[j]
-        arr.[j] <- tmp
-    Array.toList arr
     
 let readSourceFiles (options: Options) (allowedFormats: string Set option) =
     let ensureTrailingSlash (path: string) =
@@ -182,6 +174,8 @@ let readSourceFiles (options: Options) (allowedFormats: string Set option) =
             sizeOk
                 |> Array.map readFileContent
                 |> Array.toList
+                |> List.randomShuffle
+                
         with
         | :? UnauthorizedAccessException -> []
         | :? DirectoryNotFoundException -> []
@@ -261,24 +255,6 @@ the source code to write to file write2.cs
         stream = false
     }
     
-let truncateHistoryShuffle (messages: ChatMessage list) (historyLimit: int) =
-    match messages with
-    | [] -> []
-    | _ ->
-        if historyLimit <= 0 then
-            []
-        else
-            let userMessagesFun = (fun m -> m.role = "user")
-            let systemMessage = List.last messages
-            let conversations = List.take (messages.Length - 1) messages
-            let fromFirstAssistant = List.skipWhile userMessagesFun conversations
-            let pairs = fromFirstAssistant |> List.chunkBySize 2
-            let shuffledPairs = shuffle (Random()) pairs 
-            let maxPairs = (historyLimit - 1) / 2
-            let keptPairs = shuffledPairs |> List.truncate maxPairs
-            let unansweredMessages = List.takeWhile userMessagesFun conversations
-            unansweredMessages @ (keptPairs |> List.concat) @ [ systemMessage ]
-
 module HttpClientSingleton =    
     let private createClient() =
         let client = new HttpClient()
@@ -286,6 +262,8 @@ module HttpClientSingleton =
         client
         
     let Instance = lazy(createClient())
+
+exception BatchTooBigException
 
 let rec sendRequest (options: Options) (payload: ChatRequest) = async { 
     let url = $"{options.ServerUrl}/v1/chat/completions"
@@ -313,17 +291,23 @@ let rec sendRequest (options: Options) (payload: ChatRequest) = async {
         let! response = client.SendAsync(request, cts.Token) |> Async.AwaitTask
         
         let! responseContent = response.Content.ReadAsStringAsync() |> Async.AwaitTask
+        
         if response.StatusCode = HttpStatusCode.BadRequest then
-            failwithf $"Bad request received {responseContent}"
+            raise BatchTooBigException
+        
+        if not response.IsSuccessStatusCode then
+            raise (HttpRequestException($"Request failed with status code {response.StatusCode}: {responseContent}"))
 
         return responseContent
     with
-    | _ when options.HttpRetries > 0 ->
+    | :? BatchTooBigException as ex ->
+        return! raise ex
+    | :? TaskCanceledException when options.HttpRetries > 0 ->
         let newRetryAttempts = options.HttpRetries - 1
-        printfn $"Sending request to: {url} again, {newRetryAttempts} left"
+        printfn $"Retrying request to: {url}, {newRetryAttempts} attempts left"
         return! sendRequest { options with HttpRetries = newRetryAttempts } payload
     | ex ->
-        return raise ex
+        return! raise ex  // Re-throw any other unexpected exceptions
 }
     
 let getMessage (rawResponse: string) =
@@ -428,20 +412,17 @@ let printBatch list =
 
 let rewriteBatchAsync (options: Options) (files: CodeFile list)  = async {
     printfn $"\nProcessing {files.Length} files..."
-    try
-        let payload = createRewritePayload options files
-        let! response = sendRequest options payload
-        let message = getMessage response
-        match parseRewriteResponse message with
-        | Some results ->
-            printfn $"Successfully converted {results.Length} files"
-            return results
-        | None ->
-            printfn "No valid conversion returned for these files"
-            return []
-    with ex ->
-        printfn $"Error processing files: {ex.Message}, {ex.StackTrace}"
-        return []
+
+    let payload = createRewritePayload options files
+    let! response = sendRequest options payload
+    let message = getMessage response
+    match parseRewriteResponse message with
+    | Some results ->
+        printfn $"Successfully converted {results.Length} files"
+        return results
+    | None ->
+        printfn "No valid conversion returned for these files"
+        return []      
 }
 
 let private fileWriteLock = obj()
@@ -482,7 +463,7 @@ let rec rewriteFilesInBatchesAsync (options: Options) (files: CodeFile list) = a
                             results |> List.iter (writeOutputFile options.TargetPath)
                             return results.Length
                         with
-                        | ex when currentOptions.BatchSize > 1 ->
+                        | :? BatchTooBigException as ex when currentOptions.BatchSize > 1 ->
                             printfn $"Error processing batch: {ex.Message}. Retrying with smaller batch size."
                             let newBatchSize = currentOptions.BatchSize / 2
                             let smallerBatches = currentBatch |> List.chunkBySize newBatchSize
